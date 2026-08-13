@@ -29,6 +29,11 @@ As features stabilize some brief notes about them will accumulate here.
   exact scale and presents it without resampling. See
   [enable_wayland_fractional_scale](config/lua/config/enable_wayland_fractional_scale.md)
   to fall back to the previous behavior.
+* Wayland: [wezterm.gui.screens()](config/lua/wezterm.gui/screens.md) now
+  reports the fractional scale of each screen. `wl_output` can only express an
+  integer scale, so a screen at `1.5` was reported as `2.0` with an
+  `effective_dpi` of `192` rather than `144`; the scale is now derived from the
+  logical size reported by `xdg-output`.
 * DECRQCRA is now disabled by default to prevent silent screen scraping.
   Set `enable_checksum_rectangular_area = true` to re-enable it.
   Thanks to @jquast! #7701

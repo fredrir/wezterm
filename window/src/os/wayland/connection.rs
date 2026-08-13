@@ -7,8 +7,10 @@ use std::sync::atomic::AtomicUsize;
 use anyhow::{bail, Context};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
+use smithay_client_toolkit::output::OutputInfo;
 use wayland_client::backend::WaylandError;
 use wayland_client::globals::registry_queue_init;
+use wayland_client::protocol::wl_output::Transform;
 use wayland_client::{Connection as WConnection, EventQueue};
 
 use crate::screen::{ScreenInfo, Screens};
@@ -208,17 +210,22 @@ impl ConnectionOps for WaylandConnection {
                 Some(i) => i,
                 None => continue,
             };
-            let name = match info.name {
+            let name = match &info.name {
                 Some(n) => n.clone(),
                 None => format!("{} {}", info.model, info.make),
             };
 
-            let (width, height) = info
+            // physical_size is in millimeters rather than pixels, so there is
+            // no sane fallback if the compositor hasn't told us the mode yet
+            let (width, height) = match info
                 .modes
                 .iter()
                 .find(|mode| mode.current)
                 .map(|mode| mode.dimensions)
-                .unwrap_or((info.physical_size.0, info.physical_size.1));
+            {
+                Some(dimensions) => dimensions,
+                None => continue,
+            };
 
             let rect = euclid::rect(
                 info.location.0 as isize,
@@ -227,7 +234,7 @@ impl ConnectionOps for WaylandConnection {
                 height as isize,
             );
 
-            let scale = info.scale_factor as f64;
+            let scale = output_scale(&info, (width, height));
 
             // FIXME: teach this how to resolve dpi_by_screen once
             // dispatch_pending_event knows how to do the same
@@ -272,5 +279,136 @@ impl ConnectionOps for WaylandConnection {
             by_name,
             virtual_rect,
         })
+    }
+}
+
+/// wl_output only reports an integer scale, so a compositor running at 1.5
+/// reports 2. xdg-output reports the output's size in the compositor's logical
+/// coordinate space; the ratio of the mode's pixel size to that logical size is
+/// the true, fractional scale.
+fn output_scale(info: &OutputInfo, mode: (i32, i32)) -> f64 {
+    let integer_scale = info.scale_factor as f64;
+
+    // No xdg-output; the integer scale is all we have
+    let Some(logical_size) = info.logical_size else {
+        return integer_scale;
+    };
+
+    match scale_from_logical_size(info.transform, mode, logical_size) {
+        Some(scale) => scale,
+        None => {
+            log::warn!(
+                "output {:?} reports mode {mode:?} and logical size {logical_size:?}, \
+                 which imply an implausible scale; using the wl_output scale \
+                 {integer_scale} instead",
+                info.name
+            );
+            integer_scale
+        }
+    }
+}
+
+/// Returns None if the two sizes don't imply a plausible scale.
+fn scale_from_logical_size(
+    transform: Transform,
+    mode: (i32, i32),
+    logical_size: (i32, i32),
+) -> Option<f64> {
+    // The mode is in the output's own orientation while the logical size is in
+    // compositor space with the transform applied, so a rotated output pairs
+    // its mode width with its logical height.
+    let logical = match transform {
+        Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => {
+            logical_size.1
+        }
+        _ => logical_size.0,
+    };
+
+    if mode.0 <= 0 || logical <= 0 {
+        return None;
+    }
+
+    // The compositor rounds the logical size to whole pixels, so the raw ratio
+    // is slightly off: 3840px at 1.75 gives a logical width of 2194, and
+    // 3840/2194 is 1.7502. Snap to the 1/120 granularity of
+    // wp_fractional_scale_v1 -- the finest scale a compositor can express -- to
+    // recover the exact value.
+    let scale = (mode.0 as f64 * 120. / logical as f64).round() / 120.;
+
+    (0.1..=16.).contains(&scale).then_some(scale)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn derives_the_fractional_scale() {
+        // A 4k display at 1.5, which wl_output reports as scale 2
+        assert_eq!(
+            scale_from_logical_size(Transform::Normal, (3840, 2160), (2560, 1440)),
+            Some(1.5)
+        );
+        assert_eq!(
+            scale_from_logical_size(Transform::Normal, (1920, 1080), (1920, 1080)),
+            Some(1.0)
+        );
+        assert_eq!(
+            scale_from_logical_size(Transform::Normal, (3840, 2160), (1920, 1080)),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn snaps_a_rounded_logical_size() {
+        // 3840/1.75 is 2194.28, so the compositor has to round the logical
+        // size; either direction must still recover exactly 1.75
+        assert_eq!(
+            scale_from_logical_size(Transform::Normal, (3840, 2160), (2194, 1234)),
+            Some(1.75)
+        );
+        assert_eq!(
+            scale_from_logical_size(Transform::Normal, (3840, 2160), (2195, 1235)),
+            Some(1.75)
+        );
+        // 2560/1.5 is 1706.67
+        assert_eq!(
+            scale_from_logical_size(Transform::Normal, (2560, 1440), (1707, 960)),
+            Some(1.5)
+        );
+    }
+
+    #[test]
+    fn accounts_for_rotation() {
+        // A 4k output rotated a quarter turn at 1.5 is 1440x2560 logical
+        assert_eq!(
+            scale_from_logical_size(Transform::_90, (3840, 2160), (1440, 2560)),
+            Some(1.5)
+        );
+        assert_eq!(
+            scale_from_logical_size(Transform::Flipped270, (3840, 2160), (1440, 2560)),
+            Some(1.5)
+        );
+        // A half turn leaves the orientation alone
+        assert_eq!(
+            scale_from_logical_size(Transform::_180, (3840, 2160), (2560, 1440)),
+            Some(1.5)
+        );
+    }
+
+    #[test]
+    fn rejects_implausible_sizes() {
+        assert_eq!(
+            scale_from_logical_size(Transform::Normal, (0, 0), (2560, 1440)),
+            None
+        );
+        assert_eq!(
+            scale_from_logical_size(Transform::Normal, (3840, 2160), (0, 0)),
+            None
+        );
+        assert_eq!(
+            scale_from_logical_size(Transform::Normal, (3840, 2160), (60000, 1440)),
+            None
+        );
     }
 }
