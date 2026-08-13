@@ -44,6 +44,8 @@ use wayland_client::{Connection as WConnection, Dispatch, Proxy, QueueHandle};
 use wayland_egl::{is_available as egl_is_available, WlEglSurface};
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1;
+use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
 use wezterm_font::FontConfiguration;
@@ -226,6 +228,17 @@ impl WaylandWindow {
             compositor.create_surface_with_data(&qh, surface_data)
         };
 
+        let (fractional_scale_obj, viewport) = {
+            let state = conn.wayland_state.borrow();
+            match &state.fractional_scale {
+                Some(fractional_scale) => {
+                    let (obj, viewport) = fractional_scale.attach(&surface, window_id, &qh);
+                    (Some(obj), Some(viewport))
+                }
+                None => (None, None),
+            }
+        };
+
         let ResolvedGeometry {
             x: _,
             y: _,
@@ -335,6 +348,10 @@ impl WaylandWindow {
             wegl_surface: None,
             gl_state: None,
             ext_background_effect_surface: None,
+
+            fractional_scale: None,
+            viewport,
+            fractional_scale_obj,
         }));
 
         let window_handle = Window::Wayland(WaylandWindow(window_id));
@@ -614,11 +631,24 @@ pub struct WaylandWindowInner {
     wegl_surface: Option<WlEglSurface>,
     gl_state: Option<Rc<glium::backend::Context>>,
     ext_background_effect_surface: Option<ExtBackgroundEffectSurfaceV1>,
+    /// Scale reported by wp_fractional_scale_v1; takes precedence over the
+    /// integer wl_output scale when present.
+    fractional_scale: Option<f64>,
+    /// Maps the fractionally scaled buffer onto the logical surface size.
+    viewport: Option<WpViewport>,
+    fractional_scale_obj: Option<WpFractionalScaleV1>,
 }
 
 impl WaylandWindowInner {
     fn close(&mut self) {
         self.events.dispatch(WindowEvent::Destroyed);
+        // These are surface-scoped and must be destroyed before the surface.
+        if let Some(viewport) = self.viewport.take() {
+            viewport.destroy();
+        }
+        if let Some(fractional_scale) = self.fractional_scale_obj.take() {
+            fractional_scale.destroy();
+        }
         self.window.take();
     }
 
@@ -665,10 +695,22 @@ impl WaylandWindowInner {
             // Align pixel dimensions to the integer buffer scale factor
             // to satisfy the Wayland protocol requirement that buffer
             // dimensions must be an integer multiple of the buffer_scale.
-            let surface_udata = SurfaceUserData::from_wl(window.wl_surface());
-            let scale = surface_udata.surface_data.scale_factor();
-            let pixel_width = (self.dimensions.pixel_width as i32 / scale) * scale;
-            let pixel_height = (self.dimensions.pixel_height as i32 / scale) * scale;
+            // Under fractional scaling buffer_scale is 1, so aligning here
+            // would instead make the EGL surface disagree with the size the
+            // viewport destination was computed against.
+            let (pixel_width, pixel_height) = if self.fractional_active() {
+                (
+                    self.dimensions.pixel_width as i32,
+                    self.dimensions.pixel_height as i32,
+                )
+            } else {
+                let surface_udata = SurfaceUserData::from_wl(window.wl_surface());
+                let scale = surface_udata.surface_data.scale_factor();
+                (
+                    (self.dimensions.pixel_width as i32 / scale) * scale,
+                    (self.dimensions.pixel_height as i32 / scale) * scale,
+                )
+            };
 
             wegl_surface = Some(WlEglSurface::new(object_id, pixel_width, pixel_height)?);
 
@@ -827,6 +869,39 @@ impl WaylandWindowInner {
         }
     }
 
+    /// Fractional sizing is only engaged when we own the whole pixel/logical
+    /// relationship. An explicit `dpi` override decouples the rendering metrics
+    /// from the compositor scale, so in that case we stay on the integer path
+    /// rather than sizing the buffer against a scale the renderer isn't using.
+    fn fractional_active(&self) -> bool {
+        self.fractional_scale.is_some() && self.config.dpi.is_none()
+    }
+
+    /// The scale to render at: the compositor's fractional scale when it
+    /// reports one, otherwise the integer wl_output scale.
+    fn effective_scale_factor(&self) -> f64 {
+        if !self.fractional_active() {
+            return SurfaceUserData::from_wl(self.surface())
+                .surface_data
+                .scale_factor() as f64;
+        }
+        self.fractional_scale.unwrap_or(1.0)
+    }
+
+    pub(super) fn fractional_scale_changed(&mut self, factor: f64) {
+        if self.fractional_scale == Some(factor) {
+            return;
+        }
+        self.fractional_scale.replace(factor);
+
+        let dpi = self
+            .config
+            .dpi
+            .unwrap_or((factor * crate::DEFAULT_DPI).round()) as i32;
+        self.pending_event.lock().unwrap().dpi.replace(dpi);
+        self.dispatch_pending_event();
+    }
+
     pub(crate) fn dispatch_pending_event(&mut self) {
         let mut pending;
         {
@@ -868,12 +943,16 @@ impl WaylandWindowInner {
         if let Some((mut w, mut h)) = pending.configure.take() {
             log::trace!("Pending configure: w:{w}, h{h} -- {:?}", self.window);
             if self.window.is_some() {
-                let surface_udata = SurfaceUserData::from_wl(self.surface());
-                let factor = surface_udata.surface_data.scale_factor() as f64;
+                let factor = self.effective_scale_factor();
                 let old_dimensions = self.dimensions;
 
                 // FIXME: teach this how to resolve dpi_by_screen
-                let dpi = self.config.dpi.unwrap_or(factor * crate::DEFAULT_DPI) as usize;
+                // Rounded, not truncated: the protocol reports scale in 1/120
+                // steps, so factor * 96 is frequently not an integer.
+                let dpi = self
+                    .config
+                    .dpi
+                    .unwrap_or((factor * crate::DEFAULT_DPI).round()) as usize;
 
                 // Do this early because this affects surface_to_pixels/pixels_to_surface
                 self.dimensions.dpi = dpi;
@@ -901,9 +980,13 @@ impl WaylandWindowInner {
                 // Align pixel dimensions to the integer buffer scale factor
                 // to satisfy the Wayland protocol requirement that buffer
                 // dimensions must be an integer multiple of the buffer_scale.
-                let scale = factor as i32;
-                pixel_width = (pixel_width / scale) * scale;
-                pixel_height = (pixel_height / scale) * scale;
+                // Under fractional scaling buffer_scale stays at 1, so any
+                // buffer size is legal and no alignment is needed.
+                if !self.fractional_active() {
+                    let scale = factor as i32;
+                    pixel_width = (pixel_width / scale) * scale;
+                    pixel_height = (pixel_height / scale) * scale;
+                }
 
                 log::trace!("Resizing frame");
                 if !self.window_frame.is_hidden() {
@@ -914,13 +997,38 @@ impl WaylandWindowInner {
                     pending.refresh_decorations = true
                 }
                 let (x, y) = self.window_frame.location();
-                let surface_width = self.pixels_to_surface(pixel_width);
-                let surface_height = self.pixels_to_surface(pixel_height);
+                let (surface_width, surface_height) = if self.fractional_active() {
+                    // Anchor to the logical size the compositor configured, not
+                    // to a pixels_to_surface round trip: that rounds up, so it
+                    // would both overshoot the configure by a logical pixel and
+                    // leave buffer:destination off the true scale, making the
+                    // compositor resample the very buffer we sized to avoid it.
+                    let (sw, sh) = (w as i32, h as i32);
+                    pixel_width = (sw as f64 * factor).round() as i32;
+                    pixel_height = (sh as f64 * factor).round() as i32;
+                    (sw, sh)
+                } else {
+                    (
+                        self.pixels_to_surface(pixel_width),
+                        self.pixels_to_surface(pixel_height),
+                    )
+                };
                 self.window
                     .as_mut()
                     .unwrap()
                     .xdg_surface()
                     .set_window_geometry(x, y, surface_width, surface_height);
+                // Tell the compositor the logical size the scaled buffer
+                // should occupy; without this the buffer would be presented
+                // at its raw pixel size. Reset to -1 when not driving the
+                // fractional path so a stale destination cannot linger.
+                if let Some(viewport) = &self.viewport {
+                    if self.fractional_active() && surface_width > 0 && surface_height > 0 {
+                        viewport.set_destination(surface_width, surface_height);
+                    } else {
+                        viewport.set_destination(-1, -1);
+                    }
+                }
                 // Compute the new pixel dimensions
                 let new_dimensions = Dimensions {
                     pixel_width: pixel_width.try_into().unwrap(),
@@ -955,6 +1063,14 @@ impl WaylandWindowInner {
                     if let Some(wegl_surface) = self.wegl_surface.as_mut() {
                         wegl_surface.resize(pixel_width, pixel_height, 0, 0);
                     }
+                    // Under fractional scaling the buffer is submitted at its
+                    // true pixel size and wp_viewport maps it onto the logical
+                    // size, so buffer_scale must stay at 1.
+                    let buffer_scale = if self.fractional_active() {
+                        1
+                    } else {
+                        factor as i32
+                    };
                     if self.surface_factor != factor {
                         let wayland_conn = Connection::get().unwrap().wayland();
                         let wayland_state = wayland_conn.wayland_state.borrow();
@@ -964,13 +1080,13 @@ impl WaylandWindowInner {
                         // simply detaching the buffer can cause wlroots-derived
                         // compositors consider the window to be unconfigured.
                         if let Ok((buffer, _bytes)) = pool.create_buffer(
-                            factor as i32,
-                            factor as i32,
-                            (factor * 4.0) as i32,
+                            buffer_scale,
+                            buffer_scale,
+                            buffer_scale * 4,
                             wayland_client::protocol::wl_shm::Format::Argb8888,
                         ) {
                             self.surface().attach(Some(buffer.wl_buffer()), 0, 0);
-                            self.surface().set_buffer_scale(factor as i32);
+                            self.surface().set_buffer_scale(buffer_scale);
                             self.surface_factor = factor;
                         }
                     }
@@ -1046,16 +1162,16 @@ impl WaylandWindowInner {
                 if self.text_cursor.map(|prior| prior != rect).unwrap_or(true) {
                     self.text_cursor.replace(rect);
 
-                    let surface_udata = SurfaceUserData::from_wl(&surface);
-                    let factor = surface_udata.surface_data().scale_factor();
-
                     if let Some(text_input) = &state.text_input {
                         if let Some(input) = text_input.get_text_input_for_surface(&surface) {
+                            // rect is in pixels; the protocol wants surface-local
+                            // coordinates, which under fractional scaling is not
+                            // a division by the integer wl_output scale.
                             input.set_cursor_rectangle(
-                                rect.min_x() as i32 / factor,
-                                rect.min_y() as i32 / factor,
-                                rect.width() as i32 / factor,
-                                rect.height() as i32 / factor,
+                                self.pixels_to_surface(rect.min_x() as i32),
+                                self.pixels_to_surface(rect.min_y() as i32),
+                                self.pixels_to_surface(rect.width() as i32),
+                                self.pixels_to_surface(rect.height() as i32),
                             );
                             input.commit();
                         }

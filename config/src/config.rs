@@ -528,6 +528,15 @@ pub struct Config {
     #[dynamic(default)]
     pub enable_zwlr_output_manager: bool,
 
+    /// If false, ignore wp_fractional_scale_v1 and fall back to the integer
+    /// wl_output scale, which rounds a fractional scale up to the next whole
+    /// number and lets the compositor downsample the result.
+    /// Has no effect on compositors that lack wp_fractional_scale_v1 or
+    /// wp_viewporter.
+    /// The default is true.
+    #[dynamic(default = "default_true")]
+    pub enable_wayland_fractional_scale: bool,
+
     /// Whether to prefer EGL over other GL implementations.
     /// EGL on Windows has jankier resize behavior than WGL (which
     /// is used if EGL is unavailable), but EGL survives graphics

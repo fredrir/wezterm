@@ -22,6 +22,13 @@ usually the best available version.
 As features stabilize some brief notes about them will accumulate here.
 
 #### Changed
+* Wayland: fractional scaling is now supported via `wp_fractional_scale_v1`
+  and `wp_viewporter`. Previously a fractional scale such as `1.5` was rounded
+  up to the next integer, so an oversized buffer was rendered and then
+  downsampled by the compositor, softening text. WezTerm now renders at the
+  exact scale and presents it without resampling. See
+  [enable_wayland_fractional_scale](config/lua/config/enable_wayland_fractional_scale.md)
+  to fall back to the previous behavior.
 * DECRQCRA is now disabled by default to prevent silent screen scraping.
   Set `enable_checksum_rectangular_area = true` to re-enable it.
   Thanks to @jquast! #7701

@@ -38,6 +38,7 @@ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwi
 use crate::x11::KeyboardWithFallback;
 
 use super::copy_and_paste::CopyPasteOffer;
+use super::fractional_scale::FractionalScaleState;
 use super::inputhandler::{TextInputData, TextInputState};
 use super::pointer::{PendingMouse, PointerUserData};
 use super::{OutputManagerData, OutputManagerState, SurfaceUserData, WaylandWindowInner};
@@ -51,6 +52,9 @@ pub(super) struct WaylandState {
     pub(super) subcompositor: Arc<SubcompositorState>,
     pub(super) text_input: Option<TextInputState>,
     pub(super) output_manager: Option<OutputManagerState>,
+    /// None when the compositor lacks wp_fractional_scale_v1 or wp_viewporter,
+    /// in which case we fall back to integer wl_output scaling.
+    pub(super) fractional_scale: Option<FractionalScaleState>,
     pub(super) seat: SeatState,
     pub(super) xdg: XdgShell,
     pub(super) windows: RefCell<HashMap<usize, Rc<RefCell<WaylandWindowInner>>>>,
@@ -115,6 +119,19 @@ impl WaylandState {
             text_input: TextInputState::bind(globals, qh).ok(),
             output_manager: if config::configuration().enable_zwlr_output_manager {
                 Some(OutputManagerState::bind(globals, qh)?)
+            } else {
+                None
+            },
+            fractional_scale: if config::configuration().enable_wayland_fractional_scale {
+                match FractionalScaleState::bind(globals, qh) {
+                    Ok(state) => Some(state),
+                    Err(err) => {
+                        log::info!(
+                            "fractional scaling unavailable, using integer wl_output scale: {err}"
+                        );
+                        None
+                    }
+                }
             } else {
                 None
             },
