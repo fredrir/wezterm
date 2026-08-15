@@ -1,0 +1,86 @@
+# Pinned build of this fork. Native mux requires every machine to run the
+# same build, so bump _commit together with config/pins.dotfile in dotfiles,
+# then rebuild on each machine:
+#
+#   cp packaging/arch/PKGBUILD <scratch dir> && cd <scratch dir>
+#   makepkg -f
+#   sudo pacman -U wezterm-fredrir-*.pkg.tar.zst
+
+: "${RUSTUP_TOOLCHAIN:=stable}"
+export RUSTUP_TOOLCHAIN
+
+_pkgname=wezterm
+pkgname=wezterm-fredrir
+pkgdesc="A GPU-accelerated cross-platform terminal emulator and multiplexer (pinned fredrir fork)"
+_commit=18a44cb7028a40abb26230497b674d41c041bef3
+pkgver=20260813.114614.g18a44cb7
+pkgrel=1
+url="https://github.com/fredrir/wezterm"
+license=('MIT')
+arch=('x86_64')
+
+depends=(
+  'fontconfig'
+  'libx11'
+  'libxcb'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'openssl'
+  'wayland'
+  'xcb-util'
+  'xcb-util-image'
+  'zlib'
+)
+makedepends=(
+  'cargo'
+  'cmake'
+  'git'
+  'python'
+)
+optdepends=(
+  'noto-fonts-emoji: for default fonts'
+  'ttf-nerd-fonts-symbols-mono: for default fonts'
+)
+
+provides=("$_pkgname")
+conflicts=("$_pkgname" "$_pkgname-git")
+
+options=('!lto')
+
+source=("$_pkgname::git+$url.git#commit=$_commit")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$_pkgname"
+  git submodule update --init --recursive --depth=1
+  cargo fetch --locked
+}
+
+build() {
+  cd "$_pkgname"
+  cargo build --frozen --release \
+    -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+}
+
+package() {
+  cd "$_pkgname"
+
+  install -Dm755 target/release/wezterm -t "$pkgdir/usr/bin/"
+  install -Dm755 target/release/wezterm-gui -t "$pkgdir/usr/bin/"
+  install -Dm755 target/release/wezterm-mux-server -t "$pkgdir/usr/bin/"
+  install -Dm755 target/release/strip-ansi-escapes -t "$pkgdir/usr/bin/"
+
+  install -Dm644 assets/icon/terminal.png "$pkgdir/usr/share/pixmaps/org.wezfurlong.wezterm.png"
+  install -Dm644 assets/wezterm.desktop "$pkgdir/usr/share/applications/org.wezfurlong.wezterm.desktop"
+  install -Dm644 assets/wezterm.appdata.xml "$pkgdir/usr/share/metainfo/org.wezfurlong.wezterm.appdata.xml"
+
+  install -Dm755 assets/open-wezterm-here -t "$pkgdir/usr/bin/"
+  install -Dm644 assets/shell-completion/bash "$pkgdir/usr/share/bash-completion/completions/wezterm"
+  install -Dm644 assets/shell-completion/zsh "$pkgdir/usr/share/zsh/site-functions/_wezterm"
+  install -Dm644 assets/shell-completion/fish "$pkgdir/usr/share/fish/completions/wezterm.fish"
+  install -Dm644 assets/shell-integration/wezterm.sh "$pkgdir/etc/profile.d/wezterm.sh"
+
+  tic -xe wezterm -o "$pkgdir/usr/share/terminfo" termwiz/data/wezterm.terminfo
+
+  install -Dm644 LICENSE.md -t "$pkgdir/usr/share/licenses/$pkgname"
+}
