@@ -1,95 +1,126 @@
-# Pinned build of this fork. Native mux requires every machine to run the
-# same build, so bump _commit together with config/pins.dotfile in dotfiles,
-# then rebuild on each machine:
-#
-#   cp packaging/arch/PKGBUILD <scratch dir> && cd <scratch dir>
-#   makepkg -f
-#   sudo pacman -U wezterm-fredrir-*.pkg.tar.zst
+# Maintainer: fredrir <fhansteen at gmail dot com>
 
+: "${CARGO_HOME:=$SRCDEST/cargo-home}"
+: "${CARGO_TARGET_DIR:=target}"
 : "${RUSTUP_TOOLCHAIN:=stable}"
-export RUSTUP_TOOLCHAIN
+export CARGO_HOME CARGO_TARGET_DIR RUSTUP_TOOLCHAIN
+export LIBSSH2_SYS_USE_PKG_CONFIG=1
+export ZSTD_SYS_USE_PKG_CONFIG=1
 
 _pkgname=wezterm
-pkgname=wezterm-fredrir
-pkgdesc="A GPU-accelerated cross-platform terminal emulator and multiplexer (pinned fredrir fork)"
-_commit=18a44cb7028a40abb26230497b674d41c041bef3
-pkgver=20260813.114614.g18a44cb7
-pkgrel=2
+pkgname=wezterm-fredrir-git
+pkgver=20260816.143635.72f3fd75
+pkgrel=1
+pkgdesc="A GPU-accelerated cross-platform terminal emulator and multiplexer (fredrir fork)"
+arch=('x86_64')
 url="https://github.com/fredrir/wezterm"
 license=('MIT')
-arch=('x86_64')
-
 depends=(
+  'bash'
   'fontconfig'
+  'glib2'
+  'glibc'
+  'hicolor-icon-theme'
+  'libgcc'
+  'libgit2'
+  'libssh2'
+  'libstdc++'
   'libx11'
   'libxcb'
   'libxkbcommon'
   'libxkbcommon-x11'
   'openssl'
+  'ttf-jetbrains-mono'
+  'ttf-roboto'
   'wayland'
   'xcb-util'
   'xcb-util-image'
   'zlib'
+  'zstd'
 )
 makedepends=(
   'cargo'
   'cmake'
   'git'
+  'pkgconf'
   'python'
 )
 optdepends=(
+  'ncurses: for the WezTerm terminfo database'
   'noto-fonts-emoji: for default fonts'
+  'nautilus-python: for the WezTerm context menu in Nautilus'
   'ttf-nerd-fonts-symbols-mono: for default fonts'
 )
-
-provides=("$_pkgname")
-conflicts=("$_pkgname" "$_pkgname-git")
-
+provides=("wezterm=$pkgver")
+conflicts=('wezterm' 'wezterm-shell-integration')
 options=('!lto')
+source=(
+  "$_pkgname::git+$url.git#branch=fredrir"
+  "$_pkgname-freetype2::git+https://github.com/freetype/freetype2.git"
+  "$_pkgname-harfbuzz::git+https://github.com/harfbuzz/harfbuzz.git"
+  "$_pkgname-libpng::git+https://github.com/glennrp/libpng.git"
+  "$_pkgname-zlib::git+https://github.com/madler/zlib.git"
+)
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
 
-source=("$_pkgname::git+$url.git#commit=$_commit")
-sha256sums=('SKIP')
+pkgver() {
+  cd "$_pkgname"
+  git -c core.abbrev=8 show -s \
+    --format='%cd.%h' \
+    --date=format:%Y%m%d.%H%M%S
+}
 
 prepare() {
   cd "$_pkgname"
-  git submodule update --init --recursive --depth=1
-  cargo fetch --locked
+  git submodule init
+  git config submodule."harfbuzz/harfbuzz".url "$srcdir/$_pkgname-harfbuzz"
+  git config submodule."freetype/libpng".url "$srcdir/$_pkgname-libpng"
+  git config submodule."deps/freetype/zlib".url "$srcdir/$_pkgname-zlib"
+  git config submodule."freetype2".url "$srcdir/$_pkgname-freetype2"
+  git -c protocol.file.allow=always submodule update --init --recursive
+
+  sed -i 's/"vendored-fonts", //' wezterm-gui/Cargo.toml
+  cargo fetch --locked --target "$(rustc --print host-tuple)"
 }
 
 build() {
   cd "$_pkgname"
-  # Rust-side optimization; makepkg's lto option is C-only, so this is
-  # independent of options=('!lto') above (which must stay: makepkg's
-  # C-side -flto breaks the link of cc-built deps, wezterm#4987). Measured
-  # effect: ~10% smaller binaries, runtime within noise.
-  export CARGO_PROFILE_RELEASE_LTO=thin
-  export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
-  export RUSTFLAGS="${RUSTFLAGS} -Ctarget-cpu=znver5"
-  export CFLAGS="${CFLAGS} -march=znver5"
-  export CXXFLAGS="${CXXFLAGS} -march=znver5"
-  cargo build --frozen --release \
-    -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+  cargo build --frozen --release --features distro-defaults
+}
+
+check() {
+  cd "$_pkgname"
+  cargo test --frozen --release -- --skip 'e2e::'
 }
 
 package() {
   cd "$_pkgname"
 
-  install -Dm755 target/release/wezterm -t "$pkgdir/usr/bin/"
-  install -Dm755 target/release/wezterm-gui -t "$pkgdir/usr/bin/"
-  install -Dm755 target/release/wezterm-mux-server -t "$pkgdir/usr/bin/"
-  install -Dm755 target/release/strip-ansi-escapes -t "$pkgdir/usr/bin/"
+  install -Dm755 "$CARGO_TARGET_DIR/release/$_pkgname" -t "$pkgdir/usr/bin/"
+  install -Dm755 "$CARGO_TARGET_DIR/release/$_pkgname-gui" -t "$pkgdir/usr/bin/"
+  install -Dm755 "$CARGO_TARGET_DIR/release/$_pkgname-mux-server" -t "$pkgdir/usr/bin/"
+  install -Dm755 "$CARGO_TARGET_DIR/release/strip-ansi-escapes" -t "$pkgdir/usr/bin/"
 
-  install -Dm644 assets/icon/terminal.png "$pkgdir/usr/share/pixmaps/org.wezfurlong.wezterm.png"
-  install -Dm644 assets/wezterm.desktop "$pkgdir/usr/share/applications/org.wezfurlong.wezterm.desktop"
-  install -Dm644 assets/wezterm.appdata.xml "$pkgdir/usr/share/metainfo/org.wezfurlong.wezterm.appdata.xml"
+  install -Dm644 assets/icon/terminal.png \
+    "$pkgdir/usr/share/icons/hicolor/128x128/apps/org.wezfurlong.$_pkgname.png"
+  install -Dm644 "assets/$_pkgname.desktop" \
+    "$pkgdir/usr/share/applications/org.wezfurlong.$_pkgname.desktop"
+  install -Dm644 "assets/$_pkgname.appdata.xml" \
+    "$pkgdir/usr/share/metainfo/org.wezfurlong.$_pkgname.appdata.xml"
+  install -Dm644 "assets/$_pkgname-nautilus.py" \
+    "$pkgdir/usr/share/nautilus-python/extensions/$_pkgname-nautilus.py"
 
-  install -Dm755 assets/open-wezterm-here -t "$pkgdir/usr/bin/"
-  install -Dm644 assets/shell-completion/bash "$pkgdir/usr/share/bash-completion/completions/wezterm"
-  install -Dm644 assets/shell-completion/zsh "$pkgdir/usr/share/zsh/site-functions/_wezterm"
-  install -Dm644 assets/shell-completion/fish "$pkgdir/usr/share/fish/completions/wezterm.fish"
-  install -Dm644 assets/shell-integration/wezterm.sh "$pkgdir/etc/profile.d/wezterm.sh"
+  install -Dm755 "assets/open-$_pkgname-here" -t "$pkgdir/usr/bin/"
+  install -Dm644 assets/shell-completion/bash \
+    "$pkgdir/usr/share/bash-completion/completions/$_pkgname"
+  install -Dm644 assets/shell-completion/fish \
+    "$pkgdir/usr/share/fish/vendor_completions.d/$_pkgname.fish"
+  install -Dm644 assets/shell-completion/zsh \
+    "$pkgdir/usr/share/zsh/site-functions/_$_pkgname"
+  install -Dm644 "assets/shell-integration/$_pkgname.sh" -t "$pkgdir/etc/profile.d/"
 
-  tic -xe wezterm -o "$pkgdir/usr/share/terminfo" termwiz/data/wezterm.terminfo
-
-  install -Dm644 LICENSE.md -t "$pkgdir/usr/share/licenses/$pkgname"
+  install -Dm644 LICENSE.md -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
 }
+
+# vim: ts=2 sw=2 et:
