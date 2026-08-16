@@ -150,7 +150,8 @@ impl GuiFrontEnd {
                         | Alert::SetUserVar { .. },
                 } => {}
                 MuxNotification::Empty => {
-                    if config::configuration().quit_when_all_windows_are_closed {
+                    let config = config::configuration();
+                    if config.quit_when_all_windows_are_closed && !config.dmux_managed_gui {
                         promise::spawn::spawn_into_main_thread(async move {
                             if mux::activity::Activity::count() == 0 {
                                 log::trace!("Mux is now empty, terminate gui");
@@ -219,6 +220,12 @@ impl GuiFrontEnd {
         log::trace!("Got app event {event:?}");
         match event {
             ApplicationEvent::OpenCommandScript(file_name) => {
+                if config::configuration().dmux_managed_gui {
+                    log::warn!(
+                        "refusing native open-command request in dmux-managed GUI: {file_name}"
+                    );
+                    return;
+                }
                 let quoted_file_name = match shlex::try_quote(&file_name) {
                     Ok(name) => name.to_owned().to_string(),
                     Err(_) => {
@@ -276,6 +283,16 @@ impl GuiFrontEnd {
                 // and the user picks an action from the menubar.
                 // This is not currently possible, but could be in the
                 // future.
+
+                if !crate::dmux_managed::should_perform_native_action(
+                    config::configuration().dmux_managed_gui,
+                    &action,
+                ) {
+                    log::warn!(
+                        "refusing forbidden zero-window native action in dmux-managed GUI: {action:?}"
+                    );
+                    return;
+                }
 
                 fn spawn_command(spawn: &SpawnCommand, spawn_where: SpawnWhere) {
                     let config = config::configuration();
@@ -421,8 +438,14 @@ impl GuiFrontEnd {
                 log::trace!("Creating TermWindow for mux_window_id={}", mux_window_id);
                 if let Err(err) = TermWindow::new_window(mux_window_id).await {
                     log::error!("Failed to create window: {:#}", err);
-                    let mux = Mux::get();
-                    mux.kill_window(mux_window_id);
+                    if !config::configuration().dmux_managed_gui {
+                        let mux = Mux::get();
+                        mux.kill_window(mux_window_id);
+                    } else {
+                        log::warn!(
+                            "preserving mux window {mux_window_id} after GUI-window creation failure in dmux-managed mode"
+                        );
+                    }
                     front_end()
                         .spawned_mux_window
                         .borrow_mut()

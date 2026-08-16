@@ -21,6 +21,10 @@ extern "C" fn application_should_terminate(
     _app: *mut Object,
 ) -> u64 {
     log::debug!("application termination requested");
+    if config::configuration().dmux_managed_gui {
+        log::warn!("refusing native application termination for dmux-managed GUI");
+        return NSApplicationTerminateReply::NSTerminateCancel as u64;
+    }
     unsafe {
         match config::configuration().window_close_confirmation {
             WindowCloseConfirmation::NeverPrompt => terminate_now(),
@@ -82,6 +86,10 @@ extern "C" fn application_open_untitled_file(
 ) -> BOOL {
     let launched: BOOL = unsafe { *this.get_ivar("launched") };
     log::debug!("application_open_untitled_file launched={launched}");
+    if config::configuration().dmux_managed_gui {
+        log::warn!("ignoring native new-window request for dmux-managed GUI");
+        return YES;
+    }
     if let Some(conn) = Connection::get() {
         if launched == YES {
             conn.dispatch_app_event(ApplicationEvent::PerformKeyAssignment(
@@ -121,6 +129,10 @@ extern "C" fn application_open_file(
     let launched: BOOL = unsafe { *this.get_ivar("launched") };
     if launched == YES {
         let file_name = unsafe { nsstring_to_str(file_name) }.to_string();
+        if config::configuration().dmux_managed_gui {
+            log::warn!("ignoring native open-file request for dmux-managed GUI: {file_name}");
+            return;
+        }
         if let Some(conn) = Connection::get() {
             log::debug!("application_open_file {file_name}");
             conn.dispatch_app_event(ApplicationEvent::OpenCommandScript(file_name));
@@ -134,6 +146,9 @@ extern "C" fn application_dock_menu(
     _app: *mut Object,
 ) -> *mut Object {
     let dock_menu = Menu::new_with_title("");
+    if config::configuration().dmux_managed_gui {
+        return dock_menu.autorelease();
+    }
     let new_window_item =
         MenuItem::new_with("New Window", Some(sel!(weztermPerformKeyAssignment:)), "");
     new_window_item

@@ -170,6 +170,24 @@ impl UserData for GuiWin {
                 result.map_err(mlua::Error::external)
             },
         );
+        methods.add_async_method("dmux_safe_quit_application", |_, this, _: ()| async move {
+            let (tx, rx) = smol::channel::bounded(1);
+            this.window
+                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    tx.try_send(term_window.dmux_safe_quit_application()).ok();
+                })));
+            let result = rx.recv().await.map_err(mlua::Error::external)?;
+            result.map_err(mlua::Error::external)
+        });
+        methods.add_async_method("dmux_safe_hide_application", |_, this, _: ()| async move {
+            let (tx, rx) = smol::channel::bounded(1);
+            this.window
+                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    tx.try_send(term_window.dmux_safe_hide_application()).ok();
+                })));
+            let result = rx.recv().await.map_err(mlua::Error::external)?;
+            result.map_err(mlua::Error::external)
+        });
         methods.add_async_method("effective_config", |_, this, _: ()| async move {
             let (tx, rx) = smol::channel::bounded(1);
             this.window.notify(TermWindowNotif::GetEffectiveConfig(tx));

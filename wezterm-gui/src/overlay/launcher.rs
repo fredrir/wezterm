@@ -362,6 +362,14 @@ impl LauncherState {
             key_entries.sort_by(|a, b| a.label.cmp(&b.label));
             self.entries.append(&mut key_entries);
         }
+
+        self.entries.retain(|entry| {
+            crate::dmux_managed::should_expose_ui_action(config.dmux_managed_gui, &entry.action)
+        });
+        if config.dmux_managed_gui {
+            self.active_idx = 0;
+            self.top_row = 0;
+        }
     }
 
     fn render(&mut self, term: &mut TermWizTerminal) -> termwiz::Result<()> {
@@ -496,6 +504,9 @@ impl LauncherState {
     }
 
     fn move_down(&mut self) {
+        if self.filtered_entries.is_empty() {
+            return;
+        }
         self.active_idx = (self.active_idx + 1).min(self.filtered_entries.len() - 1);
         if self.active_idx > self.top_row + self.max_items {
             self.top_row = self.active_idx.saturating_sub(self.max_items);

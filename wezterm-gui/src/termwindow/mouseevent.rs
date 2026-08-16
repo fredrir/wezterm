@@ -393,6 +393,13 @@ impl super::TermWindow {
     ) {
         match event.kind {
             WMEK::Press(MousePress::Left) => {
+                if !crate::dmux_managed::should_close_tab_directly(self.config.dmux_managed_gui) {
+                    log::warn!(
+                        "refusing tab close-button action in dmux-managed GUI for tab index {idx}"
+                    );
+                    context.set_cursor(Some(MouseCursor::Arrow));
+                    return;
+                }
                 log::debug!("Should close tab {}", idx);
                 self.close_specific_tab(idx, true);
             }
@@ -512,7 +519,14 @@ impl super::TermWindow {
             },
             WMEK::Press(MousePress::Middle) => match item {
                 TabBarItem::Tab { tab_idx, .. } => {
-                    self.close_specific_tab(tab_idx, true);
+                    if crate::dmux_managed::should_close_tab_directly(self.config.dmux_managed_gui)
+                    {
+                        self.close_specific_tab(tab_idx, true);
+                    } else {
+                        log::warn!(
+                            "refusing middle-click tab close in dmux-managed GUI for tab index {tab_idx}"
+                        );
+                    }
                 }
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Middle);

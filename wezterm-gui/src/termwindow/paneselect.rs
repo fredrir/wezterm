@@ -162,6 +162,19 @@ impl PaneSelector {
         pane_index: usize,
         term_window: &mut TermWindow,
     ) -> anyhow::Result<()> {
+        if term_window.config.dmux_managed_gui
+            && matches!(
+                self.mode,
+                PaneSelectMode::SwapWithActive
+                    | PaneSelectMode::SwapWithActiveKeepFocus
+                    | PaneSelectMode::MoveToNewTab
+                    | PaneSelectMode::MoveToNewWindow
+            )
+        {
+            log::warn!("refusing stale pane-layout selector in dmux-managed GUI");
+            term_window.cancel_modal();
+            return Ok(());
+        }
         let mux = Mux::get();
         let tab = match mux.get_active_tab_for_window(term_window.mux_window_id) {
             Some(tab) => tab,

@@ -482,6 +482,14 @@ impl TermWindow {
     }
 
     fn close_requested(&mut self, window: &Window) {
+        if crate::dmux_managed::close_request_disposition(self.config.dmux_managed_gui)
+            == crate::dmux_managed::CloseRequestDisposition::RefuseAndNotifyBroker
+        {
+            log::warn!("refusing native window close for dmux-managed GUI; notifying dmux broker");
+            self.emit_window_event("dmux-managed-window-close-requested", None);
+            return;
+        }
+
         let mux = Mux::get();
         match self.config.window_close_confirmation {
             WindowCloseConfirmation::NeverPrompt => {
@@ -2251,6 +2259,10 @@ impl TermWindow {
     }
 
     fn move_tab(&mut self, tab_idx: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.config.dmux_managed_gui,
+            "dmux_managed_gui refused direct tab reordering"
+        );
         let mux = Mux::get();
         let mut window = mux
             .get_window_mut(self.mux_window_id)
@@ -2586,6 +2598,14 @@ impl TermWindow {
         assignment: &KeyAssignment,
     ) -> anyhow::Result<PerformAssignmentResult> {
         use KeyAssignment::*;
+
+        if !crate::dmux_managed::should_perform_native_action(
+            self.config.dmux_managed_gui,
+            assignment,
+        ) {
+            log::warn!("refusing forbidden native action in dmux-managed GUI: {assignment:?}");
+            anyhow::bail!("dmux_managed_gui refused native action: {assignment:?}");
+        }
 
         if let Some(modal) = self.get_modal() {
             if modal.perform_assignment(assignment, self) {
@@ -3166,6 +3186,32 @@ impl TermWindow {
         Ok(PerformAssignmentResult::Handled)
     }
 
+    /// Narrow post-proof exit used by dmux's authenticated bridge.
+    ///
+    /// Unlike `QuitApplication`, this is not representable as a key
+    /// assignment, menu item, mouse action, or native application callback.
+    /// The Lua bridge exposes it only after completing dmux's detach and pane
+    /// survival proof.
+    pub(crate) fn dmux_safe_quit_application(&self) -> anyhow::Result<()> {
+        crate::dmux_managed::require_managed_safe_quit_api(self.config.dmux_managed_gui)?;
+        log::info!("dmux post-proof safe quit accepted");
+        let con = Connection::get().expect("call on gui thread");
+        con.terminate_message_loop();
+        Ok(())
+    }
+
+    /// Narrow post-proof macOS hide used by dmux's authenticated bridge.
+    ///
+    /// Native `HideApplication` assignments remain denied in managed mode;
+    /// this Lua-only completion path shares the safe-quit trust boundary.
+    pub(crate) fn dmux_safe_hide_application(&self) -> anyhow::Result<()> {
+        crate::dmux_managed::require_managed_safe_hide_api(self.config.dmux_managed_gui)?;
+        log::info!("dmux post-proof safe hide accepted");
+        let con = Connection::get().expect("call on gui thread");
+        con.hide_application();
+        Ok(())
+    }
+
     fn do_open_link_at_mouse_cursor(&self, pane: &Arc<dyn Pane>) {
         // They clicked on a link, so let's open it!
         // We need to ensure that we spawn the `open` call outside of the context
@@ -3210,6 +3256,10 @@ impl TermWindow {
         }
     }
     fn close_current_pane(&mut self, confirm: bool) {
+        if self.config.dmux_managed_gui {
+            log::warn!("refusing direct pane close in dmux-managed GUI");
+            return;
+        }
         let mux_window_id = self.mux_window_id;
         let mux = Mux::get();
         let tab = match mux.get_active_tab_for_window(mux_window_id) {
@@ -3235,6 +3285,10 @@ impl TermWindow {
     }
 
     fn close_specific_tab(&mut self, tab_idx: usize, confirm: bool) {
+        if self.config.dmux_managed_gui {
+            log::warn!("refusing direct tab close in dmux-managed GUI for tab index {tab_idx}");
+            return;
+        }
         let mux = Mux::get();
         let mux_window_id = self.mux_window_id;
         let mux_window = match mux.get_window(mux_window_id) {
@@ -3266,6 +3320,10 @@ impl TermWindow {
     }
 
     fn close_current_tab(&mut self, confirm: bool) {
+        if self.config.dmux_managed_gui {
+            log::warn!("refusing direct current-tab close in dmux-managed GUI");
+            return;
+        }
         let mux = Mux::get();
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,

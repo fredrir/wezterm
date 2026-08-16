@@ -375,6 +375,9 @@ lazy_static::lazy_static! {
     static ref MUX: Mutex<Option<Arc<Mux>>> = Mutex::new(None);
 }
 
+#[cfg(test)]
+static TEST_MUX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub struct MuxWindowBuilder {
     window_id: WindowId,
     activity: Option<Activity>,
@@ -980,6 +983,22 @@ impl Mux {
         self.recompute_pane_count();
     }
 
+    /// Recovery removes only the exact window and its descendants.  The
+    /// stock window-close path may detach a whole detachable domain, which
+    /// could remove panes belonging to neighboring windows and is therefore
+    /// deliberately not used by exact crash reconciliation.
+    fn remove_window_internal_for_recovery(&self, window_id: WindowId) {
+        let window = self.windows.write().remove(&window_id);
+        if let Some(window) = window {
+            let tab_ids: Vec<_> = window.iter().map(|tab| tab.tab_id()).collect();
+            for tab_id in tab_ids {
+                self.remove_tab_internal(tab_id);
+            }
+            self.notify(MuxNotification::WindowRemoved(window_id));
+        }
+        self.recompute_pane_count();
+    }
+
     pub fn remove_pane(&self, pane_id: PaneId) {
         self.remove_pane_internal(pane_id);
         self.prune_dead_windows();
@@ -1046,6 +1065,199 @@ impl Mux {
     pub fn kill_window(&self, window_id: WindowId) {
         self.remove_window_internal(window_id);
         self.prune_dead_windows();
+    }
+
+    /// Remove one exact native node for fenced dmux crash reconciliation.
+    ///
+    /// This deliberately avoids `prune_dead_windows`: broad pruning could
+    /// remove an unrelated dead neighbor. Empty ancestors of the exact node
+    /// are instead cascaded synchronously and included in the typed outcome.
+    pub fn remove_recovery_node_exact(
+        &self,
+        target: RecoveryRemoveTarget,
+    ) -> RecoveryRemoveOutcome {
+        let kind = target.kind();
+        let requested_native_id = target.native_id();
+        let mut outcome = RecoveryRemoveOutcome::new(kind, requested_native_id);
+
+        let before_panes: HashSet<PaneId> = self.panes.read().keys().copied().collect();
+        let before_tabs: HashSet<TabId> = self.tabs.read().keys().copied().collect();
+        let before_windows: HashSet<WindowId> = self.windows.read().keys().copied().collect();
+
+        match target {
+            RecoveryRemoveTarget::Pane {
+                pane_id,
+                parent_tab_id,
+                parent_window_id,
+            } => {
+                if self.get_pane(pane_id).is_none() {
+                    outcome.status = RecoveryRemoveStatus::NotFound;
+                    return outcome;
+                }
+
+                let (_domain_id, actual_window_id, actual_tab_id) =
+                    match self.resolve_pane_id(pane_id) {
+                        Some(ids) => ids,
+                        None => {
+                            outcome.status = RecoveryRemoveStatus::ParentMismatch;
+                            return outcome;
+                        }
+                    };
+                outcome.actual_parent_tab_id = Some(actual_tab_id);
+                outcome.actual_parent_window_id = Some(actual_window_id);
+                if actual_tab_id != parent_tab_id || actual_window_id != parent_window_id {
+                    outcome.status = RecoveryRemoveStatus::ParentMismatch;
+                    return outcome;
+                }
+
+                let tab = match self.get_tab(actual_tab_id) {
+                    Some(tab) => tab,
+                    None => {
+                        outcome.status = RecoveryRemoveStatus::ParentMismatch;
+                        return outcome;
+                    }
+                };
+                let pane_count = tab.iter_panes_ignoring_zoom().len();
+                let tab_count = self
+                    .get_window(actual_window_id)
+                    .map(|window| window.len())
+                    .unwrap_or(0);
+
+                outcome.removed_pane_ids.push(pane_id);
+                if pane_count == 1 {
+                    outcome.removed_tab_ids.push(actual_tab_id);
+                    if tab_count == 1 {
+                        outcome.removed_window_ids.push(actual_window_id);
+                    }
+                }
+
+                if tab.remove_pane(pane_id).is_none() {
+                    outcome.status = RecoveryRemoveStatus::PostconditionFailed;
+                    outcome.removed_pane_ids.clear();
+                    outcome.removed_tab_ids.clear();
+                    outcome.removed_window_ids.clear();
+                    outcome.postcondition_error = Some(
+                        "pane disappeared from its validated parent before removal".to_string(),
+                    );
+                    return outcome;
+                }
+                self.remove_pane_internal(pane_id);
+
+                if pane_count == 1 {
+                    self.remove_tab_internal(actual_tab_id);
+                    if tab_count == 1 {
+                        self.remove_window_internal_for_recovery(actual_window_id);
+                    }
+                }
+            }
+            RecoveryRemoveTarget::Tab {
+                tab_id,
+                parent_window_id,
+            } => {
+                let tab = match self.get_tab(tab_id) {
+                    Some(tab) => tab,
+                    None => {
+                        outcome.status = RecoveryRemoveStatus::NotFound;
+                        return outcome;
+                    }
+                };
+                let actual_window_id = match self.window_containing_tab(tab_id) {
+                    Some(window_id) => window_id,
+                    None => {
+                        outcome.status = RecoveryRemoveStatus::ParentMismatch;
+                        return outcome;
+                    }
+                };
+                outcome.actual_parent_window_id = Some(actual_window_id);
+                if actual_window_id != parent_window_id {
+                    outcome.status = RecoveryRemoveStatus::ParentMismatch;
+                    return outcome;
+                }
+
+                outcome.removed_pane_ids = tab
+                    .iter_panes_ignoring_zoom()
+                    .into_iter()
+                    .map(|pane| pane.pane.pane_id())
+                    .collect();
+                outcome.removed_tab_ids.push(tab_id);
+                let tab_count = self
+                    .get_window(actual_window_id)
+                    .map(|window| window.len())
+                    .unwrap_or(0);
+                if tab_count == 1 {
+                    outcome.removed_window_ids.push(actual_window_id);
+                }
+
+                self.remove_tab_internal(tab_id);
+                if tab_count == 1 {
+                    self.remove_window_internal_for_recovery(actual_window_id);
+                }
+            }
+            RecoveryRemoveTarget::Window {
+                window_id,
+                workspace,
+            } => {
+                let window = match self.get_window(window_id) {
+                    Some(window) => window,
+                    None => {
+                        outcome.status = RecoveryRemoveStatus::NotFound;
+                        return outcome;
+                    }
+                };
+                let actual_workspace = window.get_workspace().to_string();
+                outcome.actual_workspace = Some(actual_workspace.clone());
+                if actual_workspace != workspace {
+                    outcome.status = RecoveryRemoveStatus::ParentMismatch;
+                    return outcome;
+                }
+
+                for tab in window.iter() {
+                    outcome.removed_tab_ids.push(tab.tab_id());
+                    for pane in tab.iter_panes_ignoring_zoom() {
+                        outcome.removed_pane_ids.push(pane.pane.pane_id());
+                    }
+                }
+                drop(window);
+                outcome.removed_window_ids.push(window_id);
+                self.remove_window_internal_for_recovery(window_id);
+            }
+        }
+
+        outcome.sort_removed_ids();
+        let expected_panes: HashSet<_> = outcome.removed_pane_ids.iter().copied().collect();
+        let expected_tabs: HashSet<_> = outcome.removed_tab_ids.iter().copied().collect();
+        let expected_windows: HashSet<_> = outcome.removed_window_ids.iter().copied().collect();
+        let after_panes: HashSet<PaneId> = self.panes.read().keys().copied().collect();
+        let after_tabs: HashSet<TabId> = self.tabs.read().keys().copied().collect();
+        let after_windows: HashSet<WindowId> = self.windows.read().keys().copied().collect();
+
+        let target_still_present = expected_panes.iter().any(|id| after_panes.contains(id))
+            || expected_tabs.iter().any(|id| after_tabs.contains(id))
+            || expected_windows.iter().any(|id| after_windows.contains(id));
+        let neighbor_missing = before_panes
+            .difference(&expected_panes)
+            .any(|id| !after_panes.contains(id))
+            || before_tabs
+                .difference(&expected_tabs)
+                .any(|id| !after_tabs.contains(id))
+            || before_windows
+                .difference(&expected_windows)
+                .any(|id| !after_windows.contains(id));
+
+        outcome.removed_pane_ids = before_panes.difference(&after_panes).copied().collect();
+        outcome.removed_tab_ids = before_tabs.difference(&after_tabs).copied().collect();
+        outcome.removed_window_ids = before_windows.difference(&after_windows).copied().collect();
+        outcome.sort_removed_ids();
+
+        if target_still_present || neighbor_missing {
+            outcome.status = RecoveryRemoveStatus::PostconditionFailed;
+            outcome.postcondition_error = Some(format!(
+                "target_still_present={target_still_present} neighboring_node_missing={neighbor_missing}"
+            ));
+        } else {
+            outcome.status = RecoveryRemoveStatus::Removed;
+        }
+        outcome
     }
 
     pub fn get_window(&self, window_id: WindowId) -> Option<MappedRwLockReadGuard<'_, Window>> {
@@ -1515,6 +1727,98 @@ pub enum WorkspaceCasError {
     NotSoleWindow { other_window_ids: Vec<WindowId> },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryNodeKind {
+    Pane,
+    Tab,
+    Window,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryRemoveTarget {
+    Pane {
+        pane_id: PaneId,
+        parent_tab_id: TabId,
+        parent_window_id: WindowId,
+    },
+    Tab {
+        tab_id: TabId,
+        parent_window_id: WindowId,
+    },
+    Window {
+        window_id: WindowId,
+        workspace: String,
+    },
+}
+
+impl RecoveryRemoveTarget {
+    pub fn kind(&self) -> RecoveryNodeKind {
+        match self {
+            Self::Pane { .. } => RecoveryNodeKind::Pane,
+            Self::Tab { .. } => RecoveryNodeKind::Tab,
+            Self::Window { .. } => RecoveryNodeKind::Window,
+        }
+    }
+
+    pub fn native_id(&self) -> usize {
+        match self {
+            Self::Pane { pane_id, .. } => *pane_id,
+            Self::Tab { tab_id, .. } => *tab_id,
+            Self::Window { window_id, .. } => *window_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryRemoveStatus {
+    Removed,
+    NotFound,
+    ParentMismatch,
+    PostconditionFailed,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RecoveryRemoveOutcome {
+    pub schema_version: u8,
+    pub status: RecoveryRemoveStatus,
+    pub kind: RecoveryNodeKind,
+    pub requested_native_id: usize,
+    pub actual_parent_tab_id: Option<TabId>,
+    pub actual_parent_window_id: Option<WindowId>,
+    pub actual_workspace: Option<String>,
+    pub removed_pane_ids: Vec<PaneId>,
+    pub removed_tab_ids: Vec<TabId>,
+    pub removed_window_ids: Vec<WindowId>,
+    pub postcondition_error: Option<String>,
+}
+
+impl RecoveryRemoveOutcome {
+    pub fn new(kind: RecoveryNodeKind, requested_native_id: usize) -> Self {
+        Self {
+            schema_version: 1,
+            status: RecoveryRemoveStatus::PostconditionFailed,
+            kind,
+            requested_native_id,
+            actual_parent_tab_id: None,
+            actual_parent_window_id: None,
+            actual_workspace: None,
+            removed_pane_ids: vec![],
+            removed_tab_ids: vec![],
+            removed_window_ids: vec![],
+            postcondition_error: None,
+        }
+    }
+
+    fn sort_removed_ids(&mut self) {
+        self.removed_pane_ids.sort_unstable();
+        self.removed_tab_ids.sort_unstable();
+        self.removed_window_ids.sort_unstable();
+    }
+}
+
 pub struct IdentityHolder {
     prior: Option<Arc<ClientId>>,
 }
@@ -1622,6 +1926,7 @@ mod cas_rename_tests {
     /// process-global `Mux` deterministic under the parallel test runner.
     #[test]
     fn rename_workspace_for_window_if_outcomes() {
+        let _serial = TEST_MUX_LOCK.lock().unwrap();
         let mux = test_mux();
 
         // Capture workspace-related notifications.  Other tests in this
@@ -1750,5 +2055,299 @@ mod cas_rename_tests {
         );
         assert_eq!(workspace_of(&mux, win_a), "dmux:host:space");
         assert!(drain(&observed).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod recovery_remove_tests {
+    use super::*;
+    use crate::pane::{ForEachPaneLogicalLine, LogicalLine, WithPaneLines};
+    use crate::renderable::*;
+    use parking_lot::{MappedMutexGuard, Mutex as ParkingMutex};
+    use rangeset::RangeSet;
+    use std::ops::Range;
+    use termwiz::surface::{Line, SequenceNo};
+    use url::Url;
+    use wezterm_term::color::ColorPalette;
+    use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex};
+
+    struct FakePane {
+        id: PaneId,
+        size: ParkingMutex<TerminalSize>,
+    }
+
+    impl FakePane {
+        fn new(id: PaneId, size: TerminalSize) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                size: ParkingMutex::new(size),
+            })
+        }
+    }
+
+    impl Pane for FakePane {
+        fn pane_id(&self) -> PaneId {
+            self.id
+        }
+
+        fn get_cursor_position(&self) -> StableCursorPosition {
+            unimplemented!()
+        }
+
+        fn get_current_seqno(&self) -> SequenceNo {
+            unimplemented!()
+        }
+
+        fn get_changed_since(
+            &self,
+            _lines: Range<StableRowIndex>,
+            _seqno: SequenceNo,
+        ) -> RangeSet<StableRowIndex> {
+            unimplemented!()
+        }
+
+        fn with_lines_mut(
+            &self,
+            _stable_range: Range<StableRowIndex>,
+            _with_lines: &mut dyn WithPaneLines,
+        ) {
+            unimplemented!()
+        }
+
+        fn for_each_logical_line_in_stable_range_mut(
+            &self,
+            _lines: Range<StableRowIndex>,
+            _for_line: &mut dyn ForEachPaneLogicalLine,
+        ) {
+            unimplemented!()
+        }
+
+        fn get_lines(&self, _lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+            unimplemented!()
+        }
+
+        fn get_logical_lines(&self, _lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
+            unimplemented!()
+        }
+
+        fn get_dimensions(&self) -> RenderableDimensions {
+            unimplemented!()
+        }
+
+        fn get_title(&self) -> String {
+            format!("fake-pane-{}", self.id)
+        }
+
+        fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
+            Ok(None)
+        }
+
+        fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
+            unimplemented!()
+        }
+
+        fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+            *self.size.lock() = size;
+            Ok(())
+        }
+
+        fn key_down(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        fn key_up(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        fn mouse_event(&self, _event: MouseEvent) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        fn is_dead(&self) -> bool {
+            false
+        }
+
+        fn palette(&self) -> ColorPalette {
+            unimplemented!()
+        }
+
+        fn domain_id(&self) -> DomainId {
+            1
+        }
+
+        fn is_mouse_grabbed(&self) -> bool {
+            false
+        }
+
+        fn is_alt_screen_active(&self) -> bool {
+            false
+        }
+
+        fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
+            None
+        }
+    }
+
+    fn test_mux() -> Arc<Mux> {
+        let mut config = config::Config::default();
+        config.mux_enable_ssh_agent = false;
+        config::use_this_configuration(config);
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        mux
+    }
+
+    fn test_size() -> TerminalSize {
+        TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        }
+    }
+
+    fn add_window(mux: &Mux, workspace: &str) -> WindowId {
+        let window = Window::new(Some(workspace.to_string()), None);
+        let window_id = window.window_id();
+        mux.windows.write().insert(window_id, window);
+        window_id
+    }
+
+    fn add_tab(mux: &Mux, window_id: WindowId, pane_ids: &[PaneId]) -> TabId {
+        assert!(!pane_ids.is_empty());
+        let size = test_size();
+        let tab = Arc::new(Tab::new(&size));
+        let mut panes = Vec::new();
+        for (index, pane_id) in pane_ids.iter().copied().enumerate() {
+            let pane = FakePane::new(pane_id, size);
+            if index == 0 {
+                tab.assign_pane(&pane);
+            } else {
+                tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&pane))
+                    .unwrap();
+            }
+            panes.push(pane);
+        }
+        mux.add_tab_no_panes(&tab);
+        for pane in panes {
+            mux.add_pane(&pane).unwrap();
+        }
+        mux.add_tab_to_window(&tab, window_id).unwrap();
+        tab.tab_id()
+    }
+
+    /// Exercises the typed exact-id outcomes in one serialized test because
+    /// Mux is process-global: exact pane/tab/window success, parent mismatch,
+    /// idempotent not-found, root-pane cascade, and neighbor preservation.
+    #[test]
+    fn exact_recovery_removal_outcomes_and_cascades() {
+        let _serial = TEST_MUX_LOCK.lock().unwrap();
+        let mux = test_mux();
+
+        let primary_window = add_window(&mux, "dmux:space:primary");
+        let split_tab = add_tab(&mux, primary_window, &[1001, 1002]);
+        let neighbor_tab = add_tab(&mux, primary_window, &[1003]);
+
+        let pane_outcome = mux.remove_recovery_node_exact(RecoveryRemoveTarget::Pane {
+            pane_id: 1001,
+            parent_tab_id: split_tab,
+            parent_window_id: primary_window,
+        });
+        assert_eq!(pane_outcome.status, RecoveryRemoveStatus::Removed);
+        assert_eq!(pane_outcome.removed_pane_ids, vec![1001]);
+        assert!(pane_outcome.removed_tab_ids.is_empty());
+        assert!(pane_outcome.removed_window_ids.is_empty());
+        assert!(mux.get_pane(1001).is_none());
+        assert!(mux.get_pane(1002).is_some());
+        assert!(mux.get_pane(1003).is_some());
+        assert!(mux.get_tab(split_tab).is_some());
+        assert!(mux.get_tab(neighbor_tab).is_some());
+        assert!(mux.get_window(primary_window).is_some());
+
+        let mismatch = mux.remove_recovery_node_exact(RecoveryRemoveTarget::Pane {
+            pane_id: 1002,
+            parent_tab_id: neighbor_tab,
+            parent_window_id: primary_window,
+        });
+        assert_eq!(mismatch.status, RecoveryRemoveStatus::ParentMismatch);
+        assert_eq!(mismatch.actual_parent_tab_id, Some(split_tab));
+        assert!(mismatch.removed_pane_ids.is_empty());
+        assert!(mux.get_pane(1002).is_some());
+        assert!(mux.get_pane(1003).is_some());
+
+        let missing = mux.remove_recovery_node_exact(RecoveryRemoveTarget::Pane {
+            pane_id: usize::MAX,
+            parent_tab_id: split_tab,
+            parent_window_id: primary_window,
+        });
+        assert_eq!(missing.status, RecoveryRemoveStatus::NotFound);
+        assert!(missing.removed_pane_ids.is_empty());
+        assert!(missing.removed_tab_ids.is_empty());
+        assert!(missing.removed_window_ids.is_empty());
+
+        let tab_outcome = mux.remove_recovery_node_exact(RecoveryRemoveTarget::Tab {
+            tab_id: neighbor_tab,
+            parent_window_id: primary_window,
+        });
+        assert_eq!(tab_outcome.status, RecoveryRemoveStatus::Removed);
+        assert_eq!(tab_outcome.removed_pane_ids, vec![1003]);
+        assert_eq!(tab_outcome.removed_tab_ids, vec![neighbor_tab]);
+        assert!(tab_outcome.removed_window_ids.is_empty());
+        assert!(mux.get_pane(1002).is_some());
+        assert!(mux.get_tab(split_tab).is_some());
+        assert!(mux.get_window(primary_window).is_some());
+
+        let root_window = add_window(&mux, "dmux:space:root-cascade");
+        let root_tab = add_tab(&mux, root_window, &[1004]);
+        let root_outcome = mux.remove_recovery_node_exact(RecoveryRemoveTarget::Pane {
+            pane_id: 1004,
+            parent_tab_id: root_tab,
+            parent_window_id: root_window,
+        });
+        assert_eq!(root_outcome.status, RecoveryRemoveStatus::Removed);
+        assert_eq!(root_outcome.removed_pane_ids, vec![1004]);
+        assert_eq!(root_outcome.removed_tab_ids, vec![root_tab]);
+        assert_eq!(root_outcome.removed_window_ids, vec![root_window]);
+        assert!(mux.get_pane(1004).is_none());
+        assert!(mux.get_tab(root_tab).is_none());
+        assert!(mux.get_window(root_window).is_none());
+        assert!(mux.get_pane(1002).is_some(), "neighbor pane was removed");
+
+        let window_to_remove = add_window(&mux, "dmux:space:window-remove");
+        let window_tab_a = add_tab(&mux, window_to_remove, &[1005]);
+        let window_tab_b = add_tab(&mux, window_to_remove, &[1006]);
+        let wrong_workspace = mux.remove_recovery_node_exact(RecoveryRemoveTarget::Window {
+            window_id: window_to_remove,
+            workspace: "dmux:space:wrong".to_string(),
+        });
+        assert_eq!(wrong_workspace.status, RecoveryRemoveStatus::ParentMismatch);
+        assert!(wrong_workspace.removed_window_ids.is_empty());
+        assert!(mux.get_window(window_to_remove).is_some());
+        assert!(mux.get_pane(1005).is_some());
+        assert!(mux.get_pane(1006).is_some());
+
+        let window_outcome = mux.remove_recovery_node_exact(RecoveryRemoveTarget::Window {
+            window_id: window_to_remove,
+            workspace: "dmux:space:window-remove".to_string(),
+        });
+        assert_eq!(window_outcome.status, RecoveryRemoveStatus::Removed);
+        assert_eq!(window_outcome.removed_pane_ids, vec![1005, 1006]);
+        assert_eq!(
+            window_outcome.removed_tab_ids,
+            vec![window_tab_a, window_tab_b]
+        );
+        assert_eq!(window_outcome.removed_window_ids, vec![window_to_remove]);
+        assert!(mux.get_window(window_to_remove).is_none());
+        assert!(mux.get_tab(window_tab_a).is_none());
+        assert!(mux.get_tab(window_tab_b).is_none());
+        assert!(mux.get_pane(1005).is_none());
+        assert!(mux.get_pane(1006).is_none());
+        assert!(mux.get_pane(1002).is_some(), "neighbor pane was removed");
+        assert!(mux.get_window(primary_window).is_some());
     }
 }

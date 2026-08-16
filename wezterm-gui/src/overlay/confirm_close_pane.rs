@@ -14,6 +14,10 @@ pub fn confirm_close_pane(
 ) -> anyhow::Result<()> {
     if confirm::run_confirmation("🛑 Really kill this pane?", &mut term)? {
         promise::spawn::spawn_into_main_thread(async move {
+            if config::configuration().dmux_managed_gui {
+                log::warn!("refusing stale pane-close confirmation in dmux-managed GUI");
+                return;
+            }
             let mux = Mux::get();
             let tab = match mux.get_active_tab_for_window(mux_window_id) {
                 Some(tab) => tab,
@@ -39,6 +43,10 @@ pub fn confirm_close_tab(
         &mut term,
     )? {
         promise::spawn::spawn_into_main_thread(async move {
+            if config::configuration().dmux_managed_gui {
+                log::warn!("refusing stale tab-close confirmation in dmux-managed GUI");
+                return;
+            }
             let mux = Mux::get();
             mux.remove_tab(tab_id);
         })
@@ -60,6 +68,10 @@ pub fn confirm_close_window(
         &mut term,
     )? {
         promise::spawn::spawn_into_main_thread(async move {
+            if config::configuration().dmux_managed_gui {
+                log::warn!("refusing stale window-close confirmation in dmux-managed GUI");
+                return;
+            }
             let mux = Mux::get();
             mux.kill_window(mux_window_id);
         })
@@ -77,6 +89,10 @@ pub fn confirm_quit_program(
 ) -> anyhow::Result<()> {
     if confirm::run_confirmation("🛑 Really Quit WezTerm?", &mut term)? {
         promise::spawn::spawn_into_main_thread(async move {
+            if config::configuration().dmux_managed_gui {
+                log::warn!("refusing stale quit confirmation in dmux-managed GUI");
+                return;
+            }
             use ::window::{Connection, ConnectionOps};
             let con = Connection::get().expect("call on gui thread");
             con.terminate_message_loop();

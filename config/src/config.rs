@@ -769,6 +769,21 @@ pub struct Config {
     #[dynamic(default)]
     pub window_close_confirmation: WindowCloseConfirmation,
 
+    /// Enables the fail-closed GUI runtime used by dmux.  When enabled,
+    /// native resource creation and lifecycle actions are both removed from
+    /// GUI surfaces and refused at execution time, while OS window-close
+    /// requests are delegated to the dmux broker event.  This is disabled by
+    /// default and is intended for the maintained dmux build rather than
+    /// general-purpose WezTerm configurations.
+    #[dynamic(default)]
+    pub dmux_managed_gui: bool,
+
+    /// Enables the narrow, exact-id native-node removal primitive used by
+    /// dmux recovery.  It is disabled by default and is intended only for a
+    /// fenced mux-server recovery coordinator.
+    #[dynamic(default)]
+    pub dmux_recovery_primitives: bool,
+
     #[dynamic(default)]
     pub native_macos_fullscreen_mode: bool,
 

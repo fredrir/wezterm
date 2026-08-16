@@ -37,6 +37,7 @@ use wezterm_toast_notification::*;
 mod colorease;
 mod commands;
 mod customglyph;
+mod dmux_managed;
 mod download;
 mod frontend;
 mod glyphcache;
@@ -319,6 +320,12 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
         trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
         return Ok(());
     }
+
+    crate::dmux_managed::require_existing_panes_after_managed_attach(
+        config::configuration().dmux_managed_gui,
+        is_connecting,
+        false,
+    )?;
 
     let _config_subscription = config::subscribe_to_config_reload(move || {
         promise::spawn::spawn_into_main_thread(async move {
@@ -1164,6 +1171,55 @@ pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyho
     Ok(())
 }
 
+fn require_dmux_managed_gui_startup(sub: &SubCommand) -> anyhow::Result<()> {
+    use crate::dmux_managed::ManagedGuiStartupInvocation as Invocation;
+
+    let invocation = match sub {
+        SubCommand::Start(start) => Invocation::Start {
+            domain: start.domain.as_deref(),
+            attach: start.attach,
+            always_new_process: start.always_new_process,
+            new_tab: start.new_tab,
+            has_prog: !start.prog.is_empty(),
+            has_cwd: start.cwd.is_some(),
+            has_workspace: start.workspace.is_some(),
+        },
+        SubCommand::Connect(connect) => Invocation::Connect {
+            domain: &connect.domain_name,
+            new_tab: connect.new_tab,
+            has_workspace: connect.workspace.is_some(),
+            has_prog: !connect.prog.is_empty(),
+        },
+        SubCommand::Ssh(_) | SubCommand::Serial(_) | SubCommand::BlockingStart(_) => {
+            Invocation::NativeCreate
+        }
+        SubCommand::LsFonts(_) | SubCommand::ShowKeys(_) => return Ok(()),
+    };
+
+    let requested =
+        std::env::var_os("DMUX_WEZ_FIRST").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if !requested {
+        return Ok(());
+    }
+
+    let config_result = config::configuration_result();
+    let config_error = config_result.as_ref().err().map(ToString::to_string);
+    crate::dmux_managed::require_successful_managed_config_load(
+        requested,
+        config_error.as_deref(),
+    )?;
+    let config = config_result.expect("managed config load was checked above");
+    let broker_socket = std::env::var_os("WEZTERM_UNIX_SOCKET");
+    crate::dmux_managed::require_managed_startup_contract(
+        requested,
+        config.dmux_managed_gui,
+        &config.default_gui_startup_args,
+        &config.unix_domains,
+        broker_socket.as_deref(),
+        invocation,
+    )
+}
+
 fn run() -> anyhow::Result<()> {
     // Inform the system of our AppUserModelID.
     // Without this, our toast notifications won't be correctly
@@ -1245,6 +1301,11 @@ fn run() -> anyhow::Result<()> {
             })?
         }
     };
+
+    // Config load errors normally retain stock defaults.  In managed mode,
+    // stop before `build_initial_mux` can turn that fallback into a local
+    // shell, and admit only the broker's exact attach-only launch contract.
+    require_dmux_managed_gui_startup(&sub)?;
 
     match sub {
         SubCommand::Start(start) => {

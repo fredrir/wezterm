@@ -131,6 +131,10 @@ fn build_commands(
         }
     }
 
+    let dmux_managed_gui = config::configuration().dmux_managed_gui;
+    commands
+        .retain(|cmd| crate::dmux_managed::should_expose_ui_action(dmux_managed_gui, &cmd.action));
+
     commands.retain(|cmd| {
         if filter_copy_mode {
             !matches!(cmd.action, KeyAssignment::CopyMode(_))

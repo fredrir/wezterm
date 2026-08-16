@@ -5,6 +5,12 @@ use std::sync::Arc;
 
 impl super::TermWindow {
     pub fn spawn_command(&self, spawn: &SpawnCommand, spawn_where: SpawnWhere) {
+        if self.config.dmux_managed_gui {
+            log::warn!(
+                "refusing direct spawn helper in dmux-managed GUI: {spawn_where:?} {spawn:?}"
+            );
+            return;
+        }
         let size = if spawn_where == SpawnWhere::NewWindow {
             self.config.initial_size(
                 self.dimensions.dpi as u32,

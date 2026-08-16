@@ -362,6 +362,10 @@ impl CommandDef {
             }
         }
 
+        result.retain(|cmd| {
+            crate::dmux_managed::should_expose_ui_action(config.dmux_managed_gui, &cmd.action)
+        });
+
         result
     }
 

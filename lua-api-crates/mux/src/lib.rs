@@ -1,13 +1,14 @@
 use config::keyassignment::SpawnTabDomain;
-use config::lua::mlua::{self, Lua, UserData, UserDataMethods, Value as LuaValue};
+use config::lua::mlua::{self, Lua, Table, UserData, UserDataMethods, Value as LuaValue};
 use config::lua::{get_or_create_module, get_or_create_sub_module};
 use luahelper::impl_lua_conversion_dynamic;
+use luahelper::mlua::LuaSerdeExt;
 use mlua::UserDataRef;
 use mux::domain::{DomainId, SplitSource};
 use mux::pane::{Pane, PaneId};
 use mux::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use mux::window::{Window, WindowId};
-use mux::Mux;
+use mux::{Mux, RecoveryRemoveOutcome, RecoveryRemoveStatus, RecoveryRemoveTarget};
 use portable_pty::CommandBuilder;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -168,7 +169,81 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
         })?,
     )?;
 
+    mux_mod.set(
+        "dmux_recovery_remove_node",
+        lua.create_function(|lua, request: Table| {
+            let target = parse_recovery_remove_target(request)?;
+            let outcome = if config::configuration().dmux_recovery_primitives {
+                let mux = get_mux()?;
+                mux.remove_recovery_node_exact(target)
+            } else {
+                let mut outcome = RecoveryRemoveOutcome::new(target.kind(), target.native_id());
+                outcome.status = RecoveryRemoveStatus::Disabled;
+                outcome
+            };
+            lua.to_value(&outcome)
+        })?,
+    )?;
+
     Ok(())
+}
+
+fn parse_recovery_remove_target(request: Table) -> mlua::Result<RecoveryRemoveTarget> {
+    let kind: String = request.raw_get("kind")?;
+    let allowed_fields: &[&str] = match kind.as_str() {
+        "pane" => &["kind", "native_id", "parent_tab_id", "parent_window_id"],
+        "tab" => &["kind", "native_id", "parent_window_id"],
+        "window" => &["kind", "native_id", "workspace"],
+        _ => {
+            return Err(mlua::Error::external(format!(
+                "invalid dmux recovery node kind {kind:?}; expected pane, tab, or window"
+            )))
+        }
+    };
+
+    for pair in request.clone().pairs::<LuaValue, LuaValue>() {
+        let (key, _value) = pair?;
+        let key = match key {
+            LuaValue::String(key) => key.to_str()?.to_string(),
+            other => {
+                return Err(mlua::Error::external(format!(
+                    "dmux recovery request keys must be strings, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        if !allowed_fields.contains(&key.as_str()) {
+            return Err(mlua::Error::external(format!(
+                "unknown field {key:?} for dmux recovery {kind} request"
+            )));
+        }
+    }
+
+    let native_id: usize = request.raw_get("native_id")?;
+    match kind.as_str() {
+        "pane" => Ok(RecoveryRemoveTarget::Pane {
+            pane_id: native_id,
+            parent_tab_id: request.raw_get("parent_tab_id")?,
+            parent_window_id: request.raw_get("parent_window_id")?,
+        }),
+        "tab" => Ok(RecoveryRemoveTarget::Tab {
+            tab_id: native_id,
+            parent_window_id: request.raw_get("parent_window_id")?,
+        }),
+        "window" => {
+            let workspace: String = request.raw_get("workspace")?;
+            if workspace.is_empty() {
+                return Err(mlua::Error::external(
+                    "dmux recovery window workspace must not be empty",
+                ));
+            }
+            Ok(RecoveryRemoveTarget::Window {
+                window_id: native_id,
+                workspace,
+            })
+        }
+        _ => unreachable!(),
+    }
 }
 
 #[derive(Debug, Default, FromDynamic, ToDynamic)]
@@ -344,3 +419,156 @@ struct MuxPaneInfo {
     pub pixel_height: usize,
 }
 impl_lua_conversion_dynamic!(MuxPaneInfo);
+
+#[cfg(test)]
+mod recovery_remove_lua_tests {
+    use super::*;
+
+    fn install_config(enabled: bool) {
+        let mut config = config::Config::default();
+        config.mux_enable_ssh_agent = false;
+        config.dmux_recovery_primitives = enabled;
+        config::use_this_configuration(config);
+    }
+
+    fn add_empty_window(mux: &Mux, workspace: &str) -> WindowId {
+        let builder = mux.new_empty_window(Some(workspace.to_string()), None);
+        let window_id = *builder;
+        drop(builder);
+        window_id
+    }
+
+    #[test]
+    fn lua_gate_closed_schema_and_typed_window_outcomes() {
+        assert!(!config::Config::default().dmux_recovery_primitives);
+        let executor = promise::spawn::SimpleExecutor::new();
+        install_config(false);
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        lua.load("wezterm = require 'wezterm'").exec().unwrap();
+
+        let (status, kind, requested_native_id, pane_count, tab_count, window_count): (
+            String,
+            String,
+            usize,
+            usize,
+            usize,
+            usize,
+        ) = lua
+            .load(
+                r#"
+                local result = wezterm.mux.dmux_recovery_remove_node {
+                  kind = 'window',
+                  native_id = 71,
+                  workspace = 'dmux:space:disabled',
+                }
+                return result.status, result.kind, result.requested_native_id,
+                       #result.removed_pane_ids, #result.removed_tab_ids,
+                       #result.removed_window_ids
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(status, "disabled");
+        assert_eq!(kind, "window");
+        assert_eq!(requested_native_id, 71);
+        assert_eq!((pane_count, tab_count, window_count), (0, 0, 0));
+
+        for forbidden_field in ["pid", "command", "workspace_ordinal"] {
+            let script = format!(
+                r#"
+                return wezterm.mux.dmux_recovery_remove_node {{
+                  kind = 'window', native_id = 71,
+                  workspace = 'dmux:space:closed-schema',
+                  {forbidden_field} = 'forbidden',
+                }}
+                "#
+            );
+            let error = lua.load(&script).eval::<LuaValue>().unwrap_err();
+            assert!(
+                error.to_string().contains("unknown field"),
+                "unexpected error for {forbidden_field}: {error:#}"
+            );
+        }
+
+        install_config(true);
+        for (request, expected_kind) in [
+            (
+                "{kind='pane', native_id=9001, parent_tab_id=9002, parent_window_id=9003}",
+                "pane",
+            ),
+            ("{kind='tab', native_id=9011, parent_window_id=9012}", "tab"),
+        ] {
+            let script = format!(
+                "local result = wezterm.mux.dmux_recovery_remove_node {request}; \
+                 return result.status, result.kind, #result.removed_pane_ids, \
+                 #result.removed_tab_ids, #result.removed_window_ids"
+            );
+            let (status, kind, panes, tabs, windows): (String, String, usize, usize, usize) =
+                lua.load(&script).eval().unwrap();
+            assert_eq!(status, "not_found");
+            assert_eq!(kind, expected_kind);
+            assert_eq!((panes, tabs, windows), (0, 0, 0));
+        }
+
+        let window_id = add_empty_window(&mux, "dmux:space:lua-exact");
+
+        let mismatch_script = format!(
+            r#"
+            local result = wezterm.mux.dmux_recovery_remove_node {{
+              kind = 'window', native_id = {window_id},
+              workspace = 'dmux:space:wrong-parent',
+            }}
+            return result.status, #result.removed_window_ids
+            "#
+        );
+        let (status, removed_count): (String, usize) = lua.load(&mismatch_script).eval().unwrap();
+        assert_eq!(status, "parent_mismatch");
+        assert_eq!(removed_count, 0);
+        assert!(mux.get_window(window_id).is_some());
+
+        let remove_script = format!(
+            r#"
+            local result = wezterm.mux.dmux_recovery_remove_node {{
+              kind = 'window', native_id = {window_id},
+              workspace = 'dmux:space:lua-exact',
+            }}
+            return result.status, result.kind, result.requested_native_id,
+                   #result.removed_pane_ids, #result.removed_tab_ids,
+                   result.removed_window_ids[1]
+            "#
+        );
+        let (status, kind, requested, pane_count, tab_count, removed_window): (
+            String,
+            String,
+            usize,
+            usize,
+            usize,
+            usize,
+        ) = lua.load(&remove_script).eval().unwrap();
+        assert_eq!(status, "removed");
+        assert_eq!(kind, "window");
+        assert_eq!(requested, window_id);
+        assert_eq!((pane_count, tab_count), (0, 0));
+        assert_eq!(removed_window, window_id);
+        assert!(mux.get_window(window_id).is_none());
+
+        let (status, pane_count, tab_count, window_count): (String, usize, usize, usize) = lua
+            .load(&remove_script)
+            .eval::<(String, String, usize, usize, usize, Option<usize>)>()
+            .map(|(status, _, _, pane_count, tab_count, removed_window)| {
+                (
+                    status,
+                    pane_count,
+                    tab_count,
+                    usize::from(removed_window.is_some()),
+                )
+            })
+            .unwrap();
+        assert_eq!(status, "not_found");
+        assert_eq!((pane_count, tab_count, window_count), (0, 0, 0));
+        executor.tick().unwrap();
+    }
+}
