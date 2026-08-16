@@ -431,6 +431,44 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::RenameWorkspaceIf(RenameWorkspaceIf {
+                window_id,
+                expected_workspace,
+                new_workspace,
+                expect_sole_window,
+            }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            use mux::WorkspaceCasError;
+                            let mux = Mux::get();
+                            let outcome = match mux.rename_workspace_for_window_if(
+                                window_id,
+                                &expected_workspace,
+                                &new_workspace,
+                                expect_sole_window,
+                            ) {
+                                Ok(()) => RenameWorkspaceCasOutcome::Renamed,
+                                Err(WorkspaceCasError::NoSuchWindow) => {
+                                    RenameWorkspaceCasOutcome::NoSuchWindow
+                                }
+                                Err(WorkspaceCasError::WorkspaceMismatch { actual }) => {
+                                    RenameWorkspaceCasOutcome::WorkspaceMismatch { actual }
+                                }
+                                Err(WorkspaceCasError::NotSoleWindow { other_window_ids }) => {
+                                    RenameWorkspaceCasOutcome::NotSoleWindow { other_window_ids }
+                                }
+                            };
+                            Ok(Pdu::RenameWorkspaceIfResponse(RenameWorkspaceIfResponse {
+                                outcome,
+                            }))
+                        },
+                        send_response,
+                    );
+                })
+                .detach();
+            }
+
             Pdu::WriteToPane(WriteToPane { pane_id, data }) => {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
@@ -1010,6 +1048,7 @@ impl SessionHandler {
             | Pdu::MovePaneToNewTabResponse { .. }
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
+            | Pdu::RenameWorkspaceIfResponse { .. }
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)))
             }

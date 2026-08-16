@@ -674,6 +674,95 @@ impl Mux {
         }
     }
 
+    /// Compare-and-swap rename of a single window's workspace.
+    ///
+    /// Verifies that `window_id` exists and currently has workspace
+    /// `expected_workspace`, then assigns `new_workspace` to that window
+    /// alone.  When `expect_sole_window` is true it additionally requires
+    /// that no other window shares `expected_workspace` at execution time.
+    /// All of the checks and the rename itself happen under a single
+    /// write lock over the window map (and, in practice, serialized on
+    /// the mux main thread with every other PDU handler), so the
+    /// precondition cannot be invalidated between check and swap.
+    ///
+    /// On `Err`, no mutation has been performed: the window map, every
+    /// client's active workspace and the per-workspace pane counts are
+    /// unchanged, and no notification is emitted.
+    ///
+    /// On success the rename is observable exactly like the stock
+    /// window-scoped rename (`Pdu::SetWindowWorkspace`):
+    /// `Window::set_workspace` emits
+    /// `MuxNotification::WindowWorkspaceChanged(window_id)`, which the
+    /// mux server dispatcher forwards to attached clients.  As a special
+    /// case, renaming to the name the window already holds is a
+    /// successful no-op that emits no notification, which makes retrying
+    /// an already-applied rename idempotent.
+    ///
+    /// When `expect_sole_window` is true, a successful rename has
+    /// provably migrated the entire `expected_workspace` name, so clients
+    /// whose active workspace was `expected_workspace` are retargeted to
+    /// `new_workspace` with `MuxNotification::ActiveWorkspaceChanged`,
+    /// mirroring `Mux::rename_workspace` semantics.  In non-sole mode
+    /// that retargeting is deliberately skipped, matching
+    /// `SetWindowWorkspace` semantics.
+    pub fn rename_workspace_for_window_if(
+        &self,
+        window_id: WindowId,
+        expected_workspace: &str,
+        new_workspace: &str,
+        expect_sole_window: bool,
+    ) -> Result<(), WorkspaceCasError> {
+        {
+            let mut windows = self.windows.write();
+
+            let actual = match windows.get(&window_id) {
+                Some(window) => window.get_workspace().to_string(),
+                None => return Err(WorkspaceCasError::NoSuchWindow),
+            };
+            if actual != expected_workspace {
+                return Err(WorkspaceCasError::WorkspaceMismatch { actual });
+            }
+
+            if expect_sole_window {
+                let other_window_ids: Vec<WindowId> = windows
+                    .values()
+                    .filter(|w| {
+                        w.window_id() != window_id && w.get_workspace() == expected_workspace
+                    })
+                    .map(|w| w.window_id())
+                    .collect();
+                if !other_window_ids.is_empty() {
+                    return Err(WorkspaceCasError::NotSoleWindow { other_window_ids });
+                }
+            }
+
+            windows
+                .get_mut(&window_id)
+                .expect("checked above under the same write lock")
+                .set_workspace(new_workspace);
+        }
+
+        self.recompute_pane_count();
+
+        if expect_sole_window && expected_workspace != new_workspace {
+            // The expected workspace name is proven to have fully migrated
+            // to `new_workspace`, so retarget clients that were following
+            // the old name, mirroring `rename_workspace` semantics
+            // (including its equal-name early return, which keeps the
+            // idempotent-retry case a true no-op).
+            for client in self.clients.write().values_mut() {
+                if client.active_workspace.as_deref() == Some(expected_workspace) {
+                    client.active_workspace.replace(new_workspace.to_string());
+                    self.notify(MuxNotification::ActiveWorkspaceChanged(
+                        client.client_id.clone(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Overrides the current client identity.
     /// Returns `IdentityHolder` which will restore the prior identity
     /// when it is dropped.
@@ -1408,6 +1497,24 @@ impl Mux {
     }
 }
 
+/// Failure modes of [`Mux::rename_workspace_for_window_if`].
+/// Every variant guarantees that no mutation was performed.
+/// The `Display` spellings match the stable failure tokens that
+/// `wezterm cli rename-workspace --window-id` reports on stderr.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum WorkspaceCasError {
+    /// No window with the requested id exists
+    #[error("no_such_window")]
+    NoSuchWindow,
+    /// The window exists but is in a different workspace
+    #[error("workspace_mismatch actual={actual:?}")]
+    WorkspaceMismatch { actual: String },
+    /// `expect_sole_window` was requested but other windows share
+    /// the expected workspace
+    #[error("not_sole_window other_window_ids={other_window_ids:?}")]
+    NotSoleWindow { other_window_ids: Vec<WindowId> },
+}
+
 pub struct IdentityHolder {
     prior: Option<Arc<ClientId>>,
 }
@@ -1471,5 +1578,177 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
                 data: Arc::new(data),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod cas_rename_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// Install a process-global Mux suitable for in-process unit tests:
+    /// no default domain, and the ssh agent proxy disabled so that
+    /// `Mux::new` has no filesystem or thread side effects.
+    fn test_mux() -> Arc<Mux> {
+        let mut config = config::Config::default();
+        config.mux_enable_ssh_agent = false;
+        config::use_this_configuration(config);
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        mux
+    }
+
+    fn add_window(mux: &Mux, workspace: &str) -> WindowId {
+        let window = Window::new(Some(workspace.to_string()), None);
+        let window_id = window.window_id();
+        mux.windows.write().insert(window_id, window);
+        window_id
+    }
+
+    fn workspace_of(mux: &Mux, window_id: WindowId) -> String {
+        mux.windows
+            .read()
+            .get(&window_id)
+            .expect("window should exist")
+            .get_workspace()
+            .to_string()
+    }
+
+    /// Covers all four `rename_workspace_for_window_if` outcomes
+    /// (Renamed / NoSuchWindow / WorkspaceMismatch / NotSoleWindow),
+    /// the zero-mutation guarantee of every failure, the notifications
+    /// emitted on success, sole-window client retargeting, and the
+    /// idempotent-retry no-op.  A single test function keeps use of the
+    /// process-global `Mux` deterministic under the parallel test runner.
+    #[test]
+    fn rename_workspace_for_window_if_outcomes() {
+        let mux = test_mux();
+
+        // Capture workspace-related notifications.  Other tests in this
+        // crate could in principle share the process-global mux, so
+        // assertions below match on the specific ids created here.
+        let observed: Arc<StdMutex<Vec<MuxNotification>>> = Arc::new(StdMutex::new(vec![]));
+        {
+            let observed = Arc::clone(&observed);
+            mux.subscribe(move |n| {
+                if matches!(
+                    n,
+                    MuxNotification::WindowWorkspaceChanged(_)
+                        | MuxNotification::ActiveWorkspaceChanged(_)
+                        | MuxNotification::WorkspaceRenamed { .. }
+                ) {
+                    observed.lock().unwrap().push(n);
+                }
+                true
+            });
+        }
+        fn drain(observed: &StdMutex<Vec<MuxNotification>>) -> Vec<MuxNotification> {
+            std::mem::take(&mut *observed.lock().unwrap())
+        }
+
+        let win_a = add_window(&mux, "source");
+
+        // A client following the source workspace, to observe
+        // sole-window retargeting.
+        let client_id = Arc::new(ClientId::new());
+        {
+            let mut clients = mux.clients.write();
+            let mut info = ClientInfo::new(Arc::clone(&client_id));
+            info.active_workspace.replace("source".to_string());
+            clients.insert((*client_id).clone(), info);
+        }
+        let active_workspace_of_client = |mux: &Mux| -> Option<String> {
+            mux.clients
+                .read()
+                .get(&client_id)
+                .expect("client should exist")
+                .active_workspace
+                .clone()
+        };
+
+        // NoSuchWindow: nothing mutated, nothing notified.
+        assert_eq!(
+            mux.rename_workspace_for_window_if(WindowId::MAX, "source", "dest", false),
+            Err(WorkspaceCasError::NoSuchWindow)
+        );
+        assert_eq!(workspace_of(&mux, win_a), "source");
+        assert!(drain(&observed).is_empty());
+
+        // WorkspaceMismatch reports the actual workspace name:
+        // nothing mutated, nothing notified.
+        assert_eq!(
+            mux.rename_workspace_for_window_if(win_a, "stale-expectation", "dest", false),
+            Err(WorkspaceCasError::WorkspaceMismatch {
+                actual: "source".to_string()
+            })
+        );
+        assert_eq!(workspace_of(&mux, win_a), "source");
+        assert!(drain(&observed).is_empty());
+
+        // NotSoleWindow lists the interloping windows:
+        // nothing mutated, nothing notified.
+        let win_b = add_window(&mux, "source");
+        assert_eq!(
+            mux.rename_workspace_for_window_if(win_a, "source", "dest", true),
+            Err(WorkspaceCasError::NotSoleWindow {
+                other_window_ids: vec![win_b]
+            })
+        );
+        assert_eq!(workspace_of(&mux, win_a), "source");
+        assert_eq!(workspace_of(&mux, win_b), "source");
+        assert!(drain(&observed).is_empty());
+
+        // Renamed without expect_sole_window: the interloper does not
+        // block, only the named window moves, and the stock
+        // WindowWorkspaceChanged notification fires for exactly that
+        // window.  The client keeps following "source"
+        // (SetWindowWorkspace semantics).
+        assert_eq!(
+            mux.rename_workspace_for_window_if(win_b, "source", "elsewhere", false),
+            Ok(())
+        );
+        assert_eq!(workspace_of(&mux, win_b), "elsewhere");
+        assert_eq!(workspace_of(&mux, win_a), "source");
+        let notifs = drain(&observed);
+        assert_eq!(notifs.len(), 1, "unexpected notifications: {notifs:?}");
+        assert!(matches!(
+            notifs[0],
+            MuxNotification::WindowWorkspaceChanged(id) if id == win_b
+        ));
+        assert_eq!(active_workspace_of_client(&mux), Some("source".to_string()));
+
+        // Renamed with expect_sole_window: the window moves, the stock
+        // notification fires, and the client following the fully
+        // migrated name is retargeted with ActiveWorkspaceChanged
+        // (rename_workspace semantics).
+        assert_eq!(
+            mux.rename_workspace_for_window_if(win_a, "source", "dmux:host:space", true),
+            Ok(())
+        );
+        assert_eq!(workspace_of(&mux, win_a), "dmux:host:space");
+        assert_eq!(
+            active_workspace_of_client(&mux),
+            Some("dmux:host:space".to_string())
+        );
+        let notifs = drain(&observed);
+        assert_eq!(notifs.len(), 2, "unexpected notifications: {notifs:?}");
+        assert!(matches!(
+            notifs[0],
+            MuxNotification::WindowWorkspaceChanged(id) if id == win_a
+        ));
+        assert!(matches!(
+            &notifs[1],
+            MuxNotification::ActiveWorkspaceChanged(id) if **id == *client_id
+        ));
+
+        // Renaming to the name the window already holds, with a correct
+        // expectation, is an idempotent success (the retry of an applied
+        // rename): no mutation, no notification.
+        assert_eq!(
+            mux.rename_workspace_for_window_if(win_a, "dmux:host:space", "dmux:host:space", true),
+            Ok(())
+        );
+        assert_eq!(workspace_of(&mux, win_a), "dmux:host:space");
+        assert!(drain(&observed).is_empty());
     }
 }
