@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 45;
+pub const CODEC_VERSION: usize = 46;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -502,6 +502,8 @@ pdu! {
     GetPaneDirection: 60,
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
+    RenameWorkspaceIf: 63,
+    RenameWorkspaceIfResponse: 64,
 }
 
 impl Pdu {
@@ -779,6 +781,44 @@ pub struct SetWindowWorkspace {
 pub struct RenameWorkspace {
     pub old_workspace: String,
     pub new_workspace: String,
+}
+
+/// Conditionally rename the workspace of a single window:
+/// a compare-and-swap that succeeds only if the window's current
+/// workspace matches `expected_workspace` at the moment the server
+/// executes the request. Used to close check-then-rename races
+/// between multiple mux clients.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct RenameWorkspaceIf {
+    pub window_id: WindowId,
+    /// The workspace the window is expected to be in
+    pub expected_workspace: String,
+    /// The workspace name to assign if the expectation holds
+    pub new_workspace: String,
+    /// When true, additionally require that `window_id` is the only
+    /// window in `expected_workspace` at execution time
+    pub expect_sole_window: bool,
+}
+
+/// Typed outcome of a `RenameWorkspaceIf` request.
+/// Any variant other than `Renamed` guarantees that no mutation
+/// was performed.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub enum RenameWorkspaceCasOutcome {
+    /// The precondition held; the window now has the new workspace name
+    Renamed,
+    /// No window with that id exists
+    NoSuchWindow,
+    /// The window exists but is in a different workspace
+    WorkspaceMismatch { actual: String },
+    /// `expect_sole_window` was requested but other windows share
+    /// the expected workspace
+    NotSoleWindow { other_window_ids: Vec<WindowId> },
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct RenameWorkspaceIfResponse {
+    pub outcome: RenameWorkspaceCasOutcome,
 }
 
 /// This is used both as a notification from server->client

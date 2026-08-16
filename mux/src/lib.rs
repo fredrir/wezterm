@@ -674,6 +674,72 @@ impl Mux {
         }
     }
 
+    /// Compare-and-swap rename of a single window's workspace.
+    ///
+    /// Atomically (under a single write lock over the window map, and,
+    /// in practice, serialized on the mux main thread with every other
+    /// PDU handler) verifies that `window_id` exists and currently has
+    /// workspace `expected_workspace`, then assigns `new_workspace`.
+    /// When `expect_sole_window` is true it additionally requires that
+    /// no other window shares `expected_workspace`.
+    ///
+    /// On any error, no mutation has been performed.
+    pub fn rename_workspace_for_window_if(
+        &self,
+        window_id: WindowId,
+        expected_workspace: &str,
+        new_workspace: &str,
+        expect_sole_window: bool,
+    ) -> Result<(), WorkspaceCasError> {
+        {
+            let mut windows = self.windows.write();
+
+            let actual = match windows.get(&window_id) {
+                Some(window) => window.get_workspace().to_string(),
+                None => return Err(WorkspaceCasError::NoSuchWindow),
+            };
+            if actual != expected_workspace {
+                return Err(WorkspaceCasError::WorkspaceMismatch { actual });
+            }
+
+            if expect_sole_window {
+                let other_window_ids: Vec<WindowId> = windows
+                    .values()
+                    .filter(|w| {
+                        w.window_id() != window_id && w.get_workspace() == expected_workspace
+                    })
+                    .map(|w| w.window_id())
+                    .collect();
+                if !other_window_ids.is_empty() {
+                    return Err(WorkspaceCasError::NotSoleWindow { other_window_ids });
+                }
+            }
+
+            windows
+                .get_mut(&window_id)
+                .expect("checked above under the same write lock")
+                .set_workspace(new_workspace);
+        }
+
+        self.recompute_pane_count();
+
+        if expect_sole_window {
+            // The expected workspace name is proven to have fully migrated
+            // to `new_workspace`, so retarget clients that were following
+            // the old name, mirroring `rename_workspace` semantics.
+            for client in self.clients.write().values_mut() {
+                if client.active_workspace.as_deref() == Some(expected_workspace) {
+                    client.active_workspace.replace(new_workspace.to_string());
+                    self.notify(MuxNotification::ActiveWorkspaceChanged(
+                        client.client_id.clone(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Overrides the current client identity.
     /// Returns `IdentityHolder` which will restore the prior identity
     /// when it is dropped.
@@ -1406,6 +1472,15 @@ impl Mux {
 
         Ok((tab, pane, window_id))
     }
+}
+
+/// Failure modes of `Mux::rename_workspace_for_window_if`.
+/// Every variant guarantees that no mutation was performed.
+#[derive(Debug, PartialEq)]
+pub enum WorkspaceCasError {
+    NoSuchWindow,
+    WorkspaceMismatch { actual: String },
+    NotSoleWindow { other_window_ids: Vec<WindowId> },
 }
 
 pub struct IdentityHolder {
