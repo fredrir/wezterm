@@ -17,6 +17,25 @@ use wezterm_term::{StableRowIndex, TerminalSize};
 pub type Tree = bintree::Tree<Arc<dyn Pane>, SplitDirectionAndSize>;
 pub type Cursor = bintree::Cursor<Arc<dyn Pane>, SplitDirectionAndSize>;
 
+const IMPORTED_DMUX_USER_VARS: [&str; 10] = [
+    "dmux_context_version",
+    "dmux_host_uid",
+    "dmux_space_uid",
+    "dmux_space_no",
+    "dmux_backend",
+    "dmux_domain",
+    "dmux_server_epoch",
+    "dmux_group_ref",
+    "dmux_split_ref",
+    "dmux_tmux_client_uid",
+];
+
+fn copy_imported_dmux_user_vars(pane: &Arc<dyn Pane>) -> HashMap<String, String> {
+    let mut vars = pane.copy_user_vars();
+    vars.retain(|name, _| IMPORTED_DMUX_USER_VARS.contains(&name.as_str()));
+    vars
+}
+
 static TAB_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type TabId = usize;
 
@@ -278,6 +297,7 @@ fn pane_tree(
                 left_col,
                 top_row,
                 tty_name: pane.tty_name(),
+                user_vars: copy_imported_dmux_user_vars(pane),
             })
         }
     }
@@ -2161,6 +2181,13 @@ pub struct PaneEntry {
     pub top_row: usize,
     pub left_col: usize,
     pub tty_name: Option<String>,
+    /// Snapshot the allowlisted dmux marker variables when a mux client
+    /// imports the pane. Unilateral SetUserVar alerts only cover changes made
+    /// after the client attaches; without this field a detached/re-attached
+    /// GUI loses every pre-existing marker until the application emits it
+    /// again. Other application user variables remain outside this protocol
+    /// snapshot so ListPanes cannot disclose unrelated values.
+    pub user_vars: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Clone, Serialize, PartialEq, Debug)]
@@ -2210,6 +2237,7 @@ mod test {
     struct FakePane {
         id: PaneId,
         size: Mutex<TerminalSize>,
+        user_vars: HashMap<String, String>,
     }
 
     impl FakePane {
@@ -2217,6 +2245,15 @@ mod test {
             Arc::new(Self {
                 id,
                 size: Mutex::new(size),
+                user_vars: HashMap::new(),
+            })
+        }
+
+        fn with_user_vars(user_vars: HashMap<String, String>) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id: 1,
+                size: Mutex::new(TerminalSize::default()),
+                user_vars,
             })
         }
     }
@@ -2314,6 +2351,29 @@ mod test {
         fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
             None
         }
+
+        fn copy_user_vars(&self) -> HashMap<String, String> {
+            self.user_vars.clone()
+        }
+    }
+
+    #[test]
+    fn imported_user_vars_are_dmux_allowlisted() {
+        let pane = FakePane::with_user_vars(HashMap::from([
+            ("dmux_context_version".to_string(), "1".to_string()),
+            ("dmux_split_ref".to_string(), "pmarker.wz-9".to_string()),
+            (
+                "application_secret".to_string(),
+                "do-not-export".to_string(),
+            ),
+        ]));
+        assert_eq!(
+            copy_imported_dmux_user_vars(&pane),
+            HashMap::from([
+                ("dmux_context_version".to_string(), "1".to_string()),
+                ("dmux_split_ref".to_string(), "pmarker.wz-9".to_string()),
+            ])
+        );
     }
 
     #[test]

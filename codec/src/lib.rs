@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 46;
+pub const CODEC_VERSION: usize = 47;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -1222,6 +1222,46 @@ mod test {
             DecodedPdu {
                 serial: 0x40,
                 pdu: Pdu::Ping(Ping {})
+            },
+            Pdu::decode(encoded.as_slice()).unwrap()
+        );
+    }
+
+    #[test]
+    fn list_panes_round_trips_imported_user_vars() {
+        let mut user_vars = HashMap::new();
+        user_vars.insert("dmux_context_version".to_string(), "1".to_string());
+        user_vars.insert(
+            "dmux_split_ref".to_string(),
+            "p55555555-5555-4555-8555-555555555555.wz-9".to_string(),
+        );
+        let expected = Pdu::ListPanesResponse(ListPanesResponse {
+            tabs: vec![PaneNode::Leaf(mux::tab::PaneEntry {
+                window_id: 1,
+                tab_id: 2,
+                pane_id: 3,
+                title: "dmux".to_string(),
+                size: TerminalSize::default(),
+                working_dir: None,
+                is_active_pane: true,
+                is_zoomed_pane: false,
+                workspace: "dmux:host:space".to_string(),
+                cursor_pos: StableCursorPosition::default(),
+                physical_top: 0,
+                top_row: 0,
+                left_col: 0,
+                tty_name: None,
+                user_vars,
+            })],
+            tab_titles: vec!["group".to_string()],
+            window_titles: HashMap::new(),
+        });
+        let mut encoded = Vec::new();
+        expected.encode(&mut encoded, 0x41).unwrap();
+        assert_eq!(
+            DecodedPdu {
+                serial: 0x41,
+                pdu: expected,
             },
             Pdu::decode(encoded.as_slice()).unwrap()
         );

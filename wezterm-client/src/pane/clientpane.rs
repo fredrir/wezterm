@@ -59,6 +59,24 @@ impl ClientPane {
         size: TerminalSize,
         title: &str,
     ) -> Self {
+        Self::new_with_user_vars(
+            client,
+            remote_tab_id,
+            remote_pane_id,
+            size,
+            title,
+            HashMap::new(),
+        )
+    }
+
+    pub(crate) fn new_with_user_vars(
+        client: &Arc<ClientInner>,
+        remote_tab_id: TabId,
+        remote_pane_id: PaneId,
+        size: TerminalSize,
+        title: &str,
+        user_vars: HashMap<String, String>,
+    ) -> Self {
         let local_pane_id = alloc_pane_id();
         let writer = PaneWriter {
             client: Arc::clone(client),
@@ -128,7 +146,7 @@ impl ClientPane {
             mouse_grabbed: Mutex::new(false),
             ignore_next_kill: Mutex::new(false),
             unseen_output: Mutex::new(false),
-            user_vars: Mutex::new(HashMap::new()),
+            user_vars: Mutex::new(user_vars),
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
         }

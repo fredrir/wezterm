@@ -588,24 +588,26 @@ impl ClientDomain {
                                 // removed it from the mux.  Let's add it back, but
                                 // with a new id.
                                 inner.remove_old_pane_mapping(entry.pane_id);
-                                let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+                                let pane: Arc<dyn Pane> = Arc::new(ClientPane::new_with_user_vars(
                                     &inner,
                                     entry.tab_id,
                                     entry.pane_id,
                                     entry.size,
                                     &entry.title,
+                                    entry.user_vars.clone(),
                                 ));
                                 mux.add_pane(&pane).expect("failed to add pane to mux");
                                 pane
                             }
                         }
                     } else {
-                        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+                        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new_with_user_vars(
                             &inner,
                             entry.tab_id,
                             entry.pane_id,
                             entry.size,
                             &entry.title,
+                            entry.user_vars.clone(),
                         ));
                         log::debug!(
                             "domain: {} attaching to remote pane {:?} -> local pane_id {}",
