@@ -15,6 +15,33 @@ use objc::*;
 
 const CLS_NAME: &str = "WezTermAppDelegate";
 
+/// Hand a native application-quit request to dmux's brokered safe-quit flow.
+///
+/// A managed GUI may never die on a native gesture: it holds imported panes
+/// whose domains have to be detached and proved first, so the caller always
+/// cancels the native termination. Cancelling alone drops the request, which
+/// is why Dock->Quit, an Apple Event quit and log out were answered with
+/// nothing but a log line. Dispatching the same assignment the in-window
+/// Cmd-Q binding uses routes them through the one signed path instead.
+///
+/// This does not make the application quit. The handler is required to refuse
+/// the native action and emit dmux's managed-quit event; failure there leaves
+/// the application resident and never falls back to native quit.
+///
+/// The dispatch itself does not block: the handler only spawns onto the main
+/// thread executor, so the delegate returns and the Apple Event gets its reply
+/// while the safe-quit flow is still running.
+fn dispatch_dmux_managed_quit_request() {
+    match Connection::get() {
+        Some(conn) => conn.dispatch_app_event(ApplicationEvent::PerformKeyAssignment(
+            KeyAssignment::QuitApplication,
+        )),
+        None => {
+            log::error!("dropping dmux-managed application quit request: no window connection")
+        }
+    }
+}
+
 extern "C" fn application_should_terminate(
     _self: &mut Object,
     _sel: Sel,
@@ -23,6 +50,7 @@ extern "C" fn application_should_terminate(
     log::debug!("application termination requested");
     if config::configuration().dmux_managed_gui {
         log::warn!("refusing native application termination for dmux-managed GUI");
+        dispatch_dmux_managed_quit_request();
         return NSApplicationTerminateReply::NSTerminateCancel as u64;
     }
     unsafe {
