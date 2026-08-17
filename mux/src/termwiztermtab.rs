@@ -35,6 +35,8 @@ use wezterm_term::{
     KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalConfiguration, TerminalSize,
 };
 
+const TERMWIZ_DOMAIN_NAME: &str = "TermWizTerminalDomain";
+
 struct TermWizTerminalDomain {
     domain_id: DomainId,
 }
@@ -44,6 +46,35 @@ impl TermWizTerminalDomain {
         let domain_id = alloc_domain_id();
         Self { domain_id }
     }
+}
+
+/// Resolve the single placeholder domain that owns every termwiz applet pane.
+///
+/// This domain exists only so that the applet's pane has a domain to belong
+/// to; it can never spawn anything and it never varies, so one instance serves
+/// the whole process. Registering a fresh one per applet leaked a row into
+/// `Mux::domains` that nothing could ever reclaim: `detachable()` is false,
+/// `state()` is hardcoded `Attached`, and there is no removal API. The leak was
+/// easy to miss because `add_domain` writes two maps and only one of them
+/// grows: `domains_by_name` is keyed by name and self-overwrites, while the
+/// id-keyed `domains` map, which backs `iter_domains`, accumulated one row per
+/// connection UI for the life of the process.
+///
+/// Callers reach this from `register_tab`, which the mux runs on the main
+/// thread, so the get-or-create needs no lock of its own.
+fn termwiz_domain(mux: &Arc<Mux>) -> Arc<dyn Domain> {
+    debug_assert!(mux.is_main_thread());
+    if let Some(existing) = mux.get_domain_by_name(TERMWIZ_DOMAIN_NAME) {
+        // Only adopt a row this module created. A configured domain that
+        // happens to share the name is somebody else's; giving an applet pane
+        // to it would be worse than registering a second placeholder.
+        if existing.downcast_ref::<TermWizTerminalDomain>().is_some() {
+            return existing;
+        }
+    }
+    let domain: Arc<dyn Domain> = Arc::new(TermWizTerminalDomain::new());
+    mux.add_domain(&domain);
+    domain
 }
 
 #[async_trait(?Send)]
@@ -66,7 +97,7 @@ impl Domain for TermWizTerminalDomain {
     }
 
     fn domain_name(&self) -> &str {
-        "TermWizTerminalDomain"
+        TERMWIZ_DOMAIN_NAME
     }
     async fn attach(&self, _window_id: Option<WindowId>) -> anyhow::Result<()> {
         Ok(())
@@ -531,10 +562,7 @@ pub async fn run<
         term_config: Option<Arc<dyn TerminalConfiguration + Send + Sync>>,
     ) -> anyhow::Result<(PaneId, WindowId)> {
         let mux = Mux::get();
-
-        // TODO: make a singleton
-        let domain: Arc<dyn Domain> = Arc::new(TermWizTerminalDomain::new());
-        mux.add_domain(&domain);
+        let domain = termwiz_domain(&mux);
 
         let window_builder;
         let window_id = match window_id {
@@ -588,4 +616,104 @@ pub async fn run<
     .detach();
 
     result
+}
+
+#[cfg(test)]
+mod termwiz_domain_tests {
+    use super::*;
+
+    /// A process-global Mux is not needed here: `termwiz_domain` takes the mux
+    /// it registers into, so each test owns its own. The ssh agent proxy is
+    /// disabled so that `Mux::new` has no thread or filesystem side effects.
+    fn test_mux() -> Arc<Mux> {
+        let mut config = config::Config::default();
+        config.mux_enable_ssh_agent = false;
+        config::use_this_configuration(config);
+        Arc::new(Mux::new(None))
+    }
+
+    /// A domain that is not ours but claims our name.
+    struct ImpostorDomain {
+        domain_id: DomainId,
+    }
+
+    #[async_trait(?Send)]
+    impl Domain for ImpostorDomain {
+        async fn spawn_pane(
+            &self,
+            _size: TerminalSize,
+            _command: Option<CommandBuilder>,
+            _command_dir: Option<String>,
+        ) -> anyhow::Result<Arc<dyn Pane>> {
+            bail!("not spawnable in a test");
+        }
+
+        fn domain_id(&self) -> DomainId {
+            self.domain_id
+        }
+
+        fn domain_name(&self) -> &str {
+            TERMWIZ_DOMAIN_NAME
+        }
+
+        async fn attach(&self, _window_id: Option<WindowId>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn detachable(&self) -> bool {
+            false
+        }
+
+        fn detach(&self) -> anyhow::Result<()> {
+            bail!("not detachable in a test");
+        }
+
+        fn state(&self) -> DomainState {
+            DomainState::Attached
+        }
+    }
+
+    #[test]
+    fn every_applet_shares_one_registered_domain() {
+        let mux = test_mux();
+        assert_eq!(mux.iter_domains().len(), 0);
+
+        let first = termwiz_domain(&mux);
+
+        // One leaked row per applet was survivable; the failure that reached a
+        // user needed a detach/re-attach cycle to produce two rows sharing one
+        // name. Prove the property over repeats, not over a single second call.
+        for _ in 0..4 {
+            let again = termwiz_domain(&mux);
+            assert!(Arc::ptr_eq(&first, &again));
+        }
+
+        // The id-keyed map is the one that used to grow. The name-keyed map
+        // always reported one, which is exactly why the leak stayed hidden, so
+        // assert the two agree rather than trusting either alone.
+        assert_eq!(mux.iter_domains().len(), 1);
+        assert_eq!(
+            mux.get_domain_by_name(TERMWIZ_DOMAIN_NAME)
+                .map(|dom| dom.domain_id()),
+            Some(first.domain_id())
+        );
+
+        // The GUI-side inventories exempt this row by capability, so the
+        // capability has to keep saying what they check for.
+        assert!(!first.spawnable());
+    }
+
+    #[test]
+    fn a_foreign_domain_sharing_the_name_is_never_adopted() {
+        let mux = test_mux();
+        let impostor: Arc<dyn Domain> = Arc::new(ImpostorDomain {
+            domain_id: alloc_domain_id(),
+        });
+        mux.add_domain(&impostor);
+
+        let ours = termwiz_domain(&mux);
+        assert!(!Arc::ptr_eq(&ours, &impostor));
+        assert_ne!(ours.domain_id(), impostor.domain_id());
+        assert!(ours.downcast_ref::<TermWizTerminalDomain>().is_some());
+    }
 }
