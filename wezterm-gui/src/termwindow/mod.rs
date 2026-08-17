@@ -939,8 +939,14 @@ impl TermWindow {
                 // global config here once per window, which could
                 // be nasty for folks with a lot of windows.
                 // <https://github.com/wezterm/wezterm/issues/2295>
-                config::reload();
-                self.config_was_reloaded();
+                if crate::dmux_managed::should_reload_gui_configuration(
+                    self.config.dmux_managed_gui,
+                ) {
+                    config::reload();
+                    self.config_was_reloaded();
+                } else {
+                    log::warn!("ignoring appearance-triggered config reload for dmux-managed GUI");
+                }
                 Ok(true)
             }
             WindowEvent::PerformKeyAssignment(action) => {
@@ -3184,32 +3190,6 @@ impl TermWindow {
             Confirmation(args) => self.show_confirmation(args),
         };
         Ok(PerformAssignmentResult::Handled)
-    }
-
-    /// Narrow post-proof exit used by dmux's authenticated bridge.
-    ///
-    /// Unlike `QuitApplication`, this is not representable as a key
-    /// assignment, menu item, mouse action, or native application callback.
-    /// The Lua bridge exposes it only after completing dmux's detach and pane
-    /// survival proof.
-    pub(crate) fn dmux_safe_quit_application(&self) -> anyhow::Result<()> {
-        crate::dmux_managed::require_managed_safe_quit_api(self.config.dmux_managed_gui)?;
-        log::info!("dmux post-proof safe quit accepted");
-        let con = Connection::get().expect("call on gui thread");
-        con.terminate_message_loop();
-        Ok(())
-    }
-
-    /// Narrow post-proof macOS hide used by dmux's authenticated bridge.
-    ///
-    /// Native `HideApplication` assignments remain denied in managed mode;
-    /// this Lua-only completion path shares the safe-quit trust boundary.
-    pub(crate) fn dmux_safe_hide_application(&self) -> anyhow::Result<()> {
-        crate::dmux_managed::require_managed_safe_hide_api(self.config.dmux_managed_gui)?;
-        log::info!("dmux post-proof safe hide accepted");
-        let con = Connection::get().expect("call on gui thread");
-        con.hide_application();
-        Ok(())
     }
 
     fn do_open_link_at_mouse_cursor(&self, pane: &Arc<dyn Pane>) {

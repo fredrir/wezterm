@@ -5,12 +5,13 @@ use mux::domain::{Domain, LocalDomain};
 use mux::Mux;
 use portable_pty::cmdbuilder::CommandBuilder;
 use std::ffi::OsString;
+use std::path::Path;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
 use wezterm_gui_subcommands::*;
-use wezterm_mux_server_impl::update_mux_domains_for_server;
+use wezterm_mux_server_impl::{local::LocalListener, update_mux_domains_for_server};
 
 mod daemonize;
 
@@ -47,6 +48,16 @@ struct Opt {
     #[arg(long = "daemonize")]
     daemonize: bool,
 
+    /// Prebind the fixed dmux service socket before configuration can start
+    /// worker threads. This is an internal service-wrapper contract.
+    #[arg(
+        long = "dmux-managed-service",
+        hide = true,
+        requires = "config_file",
+        conflicts_with_all = ["daemonize", "skip_config"]
+    )]
+    dmux_managed_service: bool,
+
     /// Specify the current working directory for the initially
     /// spawned program
     #[arg(long = "cwd", value_parser, value_hint=ValueHint::DirPath)]
@@ -81,6 +92,8 @@ fn run() -> anyhow::Result<()> {
 
     let opts = Opt::parse();
 
+    validate_dmux_managed_invocation(&opts)?;
+
     #[cfg(unix)]
     {
         // Ensure that we set CLOEXEC on the inherited lock file
@@ -90,6 +103,19 @@ fn run() -> anyhow::Result<()> {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let dmux_service_bootstrap = if opts.dmux_managed_service {
+        Some(mux_lua::dmux_descriptor::prebind_dmux_managed_service()?)
+    } else {
+        None
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    anyhow::ensure!(
+        !opts.dmux_managed_service,
+        "--dmux-managed-service is supported only on Linux and macOS"
+    );
+
     config::common_init(
         opts.config_file.as_ref(),
         &opts.config_override,
@@ -97,6 +123,24 @@ fn run() -> anyhow::Result<()> {
     )?;
 
     let config = config::configuration();
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let (dmux_listener, _dmux_service_guard) = match dmux_service_bootstrap {
+        Some(bootstrap) => {
+            let (listener, guard) = bootstrap.validate_and_take(&config)?;
+            (Some(LocalListener::new(listener)), Some(guard))
+        }
+        None => {
+            anyhow::ensure!(
+                !mux_lua::dmux_descriptor::service_bootstrap_missing_prebind_attempted(),
+                "managed mux configuration attempted bootstrap without --dmux-managed-service"
+            );
+            (None, None)
+        }
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let dmux_listener: Option<LocalListener> = None;
 
     config.update_ulimit()?;
     if let Some(value) = &config.default_ssh_auth_sock {
@@ -230,15 +274,16 @@ fn run() -> anyhow::Result<()> {
 
     let executor = promise::spawn::SimpleExecutor::new();
 
-    spawn_listener().map_err(|e| {
+    spawn_listener(dmux_listener).map_err(|e| {
         log::error!("problem spawning listeners: {:?}", e);
         e
     })?;
 
     let activity = Activity::new();
 
+    let dmux_managed_service = opts.dmux_managed_service;
     promise::spawn::spawn(async move {
-        if let Err(err) = async_run(cmd).await {
+        if let Err(err) = async_run(cmd, dmux_managed_service).await {
             terminate_with_error(err);
         }
         drop(activity);
@@ -250,6 +295,30 @@ fn run() -> anyhow::Result<()> {
     }
 }
 
+fn validate_dmux_managed_invocation(opts: &Opt) -> anyhow::Result<()> {
+    if !opts.dmux_managed_service {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        opts.config_override.is_empty() && opts.cwd.is_none() && opts.prog.is_empty(),
+        "--dmux-managed-service accepts only the fixed --config-file invocation"
+    );
+    let config_file = opts
+        .config_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--dmux-managed-service requires --config-file"))?;
+    anyhow::ensure!(
+        Path::new(config_file).is_absolute(),
+        "--dmux-managed-service requires an absolute --config-file"
+    );
+    #[cfg(unix)]
+    anyhow::ensure!(
+        opts.pid_file_fd.is_none(),
+        "--dmux-managed-service refuses inherited daemon pid-file descriptors"
+    );
+    Ok(())
+}
+
 async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
     if let Some(lua) = lua {
         let args = lua.pack_multi(())?;
@@ -258,7 +327,7 @@ async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
+async fn async_run(cmd: Option<CommandBuilder>, dmux_managed_service: bool) -> anyhow::Result<()> {
     let mux = Mux::get();
     let config = config::configuration();
 
@@ -286,7 +355,7 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
         .iter()
         .any(|p| p.domain_id() == domain.domain_id());
 
-    if !have_panes_in_domain {
+    if should_spawn_default_pane(dmux_managed_service, have_panes_in_domain)? {
         let workspace = None;
         let position = None;
         let window_id = mux.new_empty_window(workspace, position);
@@ -300,6 +369,17 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn should_spawn_default_pane(
+    dmux_managed_service: bool,
+    have_panes_in_domain: bool,
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        !dmux_managed_service || have_panes_in_domain,
+        "dmux managed mux-startup produced no sentinel/user pane; refusing default-pane fallback"
+    );
+    Ok(!have_panes_in_domain)
+}
+
 fn terminate_with_error(err: anyhow::Error) -> ! {
     log::error!("{:#}; terminating", err);
     std::process::exit(1);
@@ -307,14 +387,24 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
 
 mod ossl;
 
-pub fn spawn_listener() -> anyhow::Result<()> {
+pub fn spawn_listener(managed_listener: Option<LocalListener>) -> anyhow::Result<()> {
     let config = configuration();
-    for unix_dom in &config.unix_domains {
+    if let Some(mut listener) = managed_listener {
+        let unix_dom = config.unix_domains.first().ok_or_else(|| {
+            anyhow::anyhow!("managed listener handoff has no configured Unix domain")
+        })?;
         std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
-        let mut listener = wezterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)?;
         thread::spawn(move || {
             listener.run();
         });
+    } else {
+        for unix_dom in &config.unix_domains {
+            std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
+            let mut listener = LocalListener::with_domain(unix_dom)?;
+            thread::spawn(move || {
+                listener.run();
+            });
+        }
     }
 
     for tls_server in &config.tls_servers {
@@ -322,4 +412,73 @@ pub fn spawn_listener() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Opt, clap::Error> {
+        Opt::try_parse_from(std::iter::once("wezterm-mux-server").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn managed_service_flag_requires_exact_foreground_config_invocation() {
+        assert!(parse(&["--dmux-managed-service"]).is_err());
+        assert!(parse(&[
+            "--dmux-managed-service",
+            "--config-file",
+            "/tmp/dmux-mux.lua",
+            "--daemonize",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "--dmux-managed-service",
+            "--config-file",
+            "/tmp/dmux-mux.lua",
+            "-n",
+        ])
+        .is_err());
+
+        let exact = parse(&[
+            "--dmux-managed-service",
+            "--config-file",
+            "/tmp/dmux-mux.lua",
+        ])
+        .unwrap();
+        validate_dmux_managed_invocation(&exact).unwrap();
+
+        for extra in [
+            vec!["--cwd", "/tmp"],
+            vec!["--config", "font_size=10"],
+            vec!["--", "sh"],
+        ] {
+            let mut args = vec![
+                "--dmux-managed-service",
+                "--config-file",
+                "/tmp/dmux-mux.lua",
+            ];
+            args.extend(extra);
+            let parsed = parse(&args).unwrap();
+            assert!(validate_dmux_managed_invocation(&parsed).is_err());
+        }
+
+        let relative = parse(&["--dmux-managed-service", "--config-file", "dmux-mux.lua"]).unwrap();
+        assert!(validate_dmux_managed_invocation(&relative).is_err());
+    }
+
+    #[test]
+    fn ordinary_mux_invocation_remains_unchanged() {
+        let ordinary = parse(&["--config-file", "wezterm.lua", "--", "sh"])
+            .expect("ordinary legacy invocation parses");
+        validate_dmux_managed_invocation(&ordinary).unwrap();
+    }
+
+    #[test]
+    fn managed_mux_never_falls_through_to_the_default_program() {
+        assert_eq!(should_spawn_default_pane(false, false).unwrap(), true);
+        assert_eq!(should_spawn_default_pane(false, true).unwrap(), false);
+        assert_eq!(should_spawn_default_pane(true, true).unwrap(), false);
+        assert!(should_spawn_default_pane(true, false).is_err());
+    }
 }

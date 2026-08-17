@@ -576,6 +576,14 @@ impl ConfigInner {
     /// On failure, retain the existing configuration but
     /// replace any captured error message.
     fn reload(&mut self) {
+        if self.generation > 0
+            && (self.config.dmux_managed_gui || self.config.dmux_recovery_primitives)
+        {
+            let message = "dmux-managed configuration reload refused; restart the GUI or mux service so retained native capabilities cannot cross Lua generations";
+            log::warn!("{message}");
+            show_error(message);
+            return;
+        }
         let LoadedConfig {
             config,
             file_name,
@@ -831,4 +839,40 @@ fn default_one_point_oh() -> f32 {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod dmux_reload_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn assert_reload_is_inert(mut config: Config) {
+        config.automatically_reload_config = true;
+        let mut inner = ConfigInner::new();
+        inner.config = Arc::new(config);
+        inner.generation = 7;
+        let original = Arc::clone(&inner.config);
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&notifications);
+        inner.subscribe(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        inner.reload();
+        assert_eq!(inner.generation, 7);
+        assert!(Arc::ptr_eq(&inner.config, &original));
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        assert!(inner.watcher.is_none());
+    }
+
+    #[test]
+    fn retained_capability_configs_cannot_reload_or_publish_a_generation() {
+        let mut gui = Config::default();
+        gui.dmux_managed_gui = true;
+        assert_reload_is_inert(gui);
+
+        let mut mux = Config::default();
+        mux.dmux_recovery_primitives = true;
+        assert_reload_is_inert(mux);
+    }
 }

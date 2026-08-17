@@ -16,15 +16,19 @@ event so the dmux broker can run its authenticated detach-and-survival proof.
 config.dmux_managed_gui = true
 ```
 
-`QuitApplication` and `HideApplication` remain denied while managed mode is active. After the
-authenticated dmux bridge has detached persistent domains and proved owner
-pane survival, it can use the narrow
-[`window:dmux_safe_quit_application()`](../window/dmux_safe_quit_application.md)
-or [`window:dmux_safe_hide_application()`](../window/dmux_safe_hide_application.md)
-method. These methods are not key assignments and return an error when this
-option is disabled. Configuration Lua remains trusted and can call the
-methods; authentication and one-shot request consumption are enforced by dmux's
-signed bridge, not by this boolean.
+`QuitApplication` and `HideApplication` remain denied while managed mode is
+active. After the authenticated dmux bridge has detached persistent domains
+and proved owner pane survival, the exclusive retained
+[`wezterm.gui.dmux_bridge_open()`](../wezterm.gui/dmux_bridge_open.md)
+capability can consume the exact authenticated request and durable
+acknowledgement and complete the application-scoped lifecycle. This works
+after the last GUI window disappears. There is deliberately no global or
+window quit/hide escape hatch; direct configuration Lua cannot bypass the
+bridge proof.
+
+Managed GUI and recovery-service configurations cannot be reloaded in place.
+Their native directory, lease, and proof capabilities belong to one Lua
+generation, so a process restart is required for configuration changes.
 
 Native tab reordering, pane rotation/swap/resize/zoom, and relative workspace
 switches are denied because they bypass dmux's owner journal or exact logical

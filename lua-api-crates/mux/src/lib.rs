@@ -15,6 +15,8 @@ use std::sync::Arc;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_term::TerminalSize;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod dmux_descriptor;
 mod domain;
 mod pane;
 mod tab;
@@ -31,6 +33,9 @@ fn get_mux() -> mlua::Result<Arc<Mux>> {
 
 pub fn register(lua: &Lua) -> anyhow::Result<()> {
     let mux_mod = get_or_create_sub_module(lua, "mux")?;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    dmux_descriptor::register(lua, &mux_mod)?;
 
     mux_mod.set(
         "get_active_workspace",
@@ -448,6 +453,30 @@ mod recovery_remove_lua_tests {
         let lua = Lua::new();
         register(&lua).unwrap();
         lua.load("wezterm = require 'wezterm'").exec().unwrap();
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let (publisher, spool_open, manifest_open): (String, String, String) = lua
+                .load(
+                    "return type(wezterm.mux.dmux_publish_service_descriptor), \
+                            type(wezterm.mux.dmux_recovery_spool_open), \
+                            type(wezterm.mux.dmux_recovery_manifest_open)",
+                )
+                .eval()
+                .unwrap();
+            assert_eq!(publisher, "function");
+            assert_eq!(spool_open, "function");
+            assert_eq!(manifest_open, "function");
+            let error: String = lua
+                .load(
+                    "local ok, err = pcall(wezterm.mux.dmux_recovery_spool_open, \
+                         '11111111-1111-4111-8111-111111111111'); \
+                     assert(not ok); return tostring(err)",
+                )
+                .eval()
+                .unwrap();
+            assert!(error.contains("dmux_recovery_spool_disabled"), "{error:#}");
+        }
 
         let (status, kind, requested_native_id, pane_count, tab_count, window_count): (
             String,

@@ -9,6 +9,8 @@ use mux::window::WindowId as MuxWindowId;
 use std::collections::HashMap;
 use wezterm_dynamic::ToDynamic;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod dmux_bridge;
 pub mod guiwin;
 
 fn luaerr(err: anyhow::Error) -> mlua::Error {
@@ -17,6 +19,9 @@ fn luaerr(err: anyhow::Error) -> mlua::Error {
 
 pub fn register(lua: &Lua) -> anyhow::Result<()> {
     let window_mod = get_or_create_sub_module(lua, "gui")?;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    dmux_bridge::register(lua, &window_mod)?;
 
     window_mod.set(
         "gui_window_for_mux_window",
@@ -99,4 +104,40 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_lifecycle_completion_is_not_globally_registered() {
+        let lua = Lua::new();
+        register(&lua).unwrap();
+        let gui: mlua::Table = lua.load("return require('wezterm').gui").eval().unwrap();
+        for name in ["dmux_safe_quit_application", "dmux_safe_hide_application"] {
+            assert!(matches!(gui.get(name).unwrap(), mlua::Value::Nil));
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            for name in [
+                "dmux_bridge_capabilities",
+                "dmux_bridge_preflight",
+                "dmux_bridge_open",
+                "dmux_read_mux_descriptor",
+            ] {
+                assert!(matches!(gui.get(name).unwrap(), mlua::Value::Function(_)));
+            }
+            let open: mlua::Function = gui.get("dmux_bridge_open").unwrap();
+            let error = open.call::<_, ()>("gui-test").unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("only when dmux_managed_gui is enabled"),
+                "{}",
+                error
+            );
+        }
+    }
 }

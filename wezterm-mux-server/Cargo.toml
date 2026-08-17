@@ -17,6 +17,7 @@ env-bootstrap.workspace = true
 libc.workspace = true
 log.workspace = true
 mux.workspace = true
+mux-lua.workspace = true
 mlua.workspace = true
 openssl.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}

@@ -13,9 +13,52 @@ use promise::{Future, Promise};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use wezterm_term::{Alert, ClipboardSelection};
 use wezterm_toast_notification::*;
+
+const DMUX_MANAGED_APPLICATION_QUIT_REQUESTED: &str = "dmux-managed-application-quit-requested";
+static DMUX_APPLICATION_QUIT_EVENT_PENDING: AtomicBool = AtomicBool::new(false);
+
+fn managed_application_request_event(
+    managed: bool,
+    action: &KeyAssignment,
+) -> Option<&'static str> {
+    if managed && matches!(action, KeyAssignment::QuitApplication) {
+        Some(DMUX_MANAGED_APPLICATION_QUIT_REQUESTED)
+    } else {
+        None
+    }
+}
+
+fn emit_managed_application_quit_requested() {
+    if DMUX_APPLICATION_QUIT_EVENT_PENDING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    promise::spawn::spawn(config::with_lua_config_on_main_thread(
+        move |lua| async move {
+            let result: anyhow::Result<()> = if let Some(lua) = lua {
+                let args = lua.pack_multi(())?;
+                config::lua::emit_event(
+                    &lua,
+                    (DMUX_MANAGED_APPLICATION_QUIT_REQUESTED.to_string(), args),
+                )
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+            } else {
+                Ok(())
+            };
+            DMUX_APPLICATION_QUIT_EVENT_PENDING.store(false, Ordering::Release);
+            result
+        },
+    ))
+    .detach();
+}
 
 pub struct GuiFrontEnd {
     connection: Rc<Connection>,
@@ -207,7 +250,14 @@ impl GuiFrontEnd {
         // Re-evaluate the config so that folks that are using
         // `wezterm.gui.get_appearance()` can have that take effect
         // before any windows are created
-        config::reload();
+        // A managed GUI retains native bridge capabilities for its one Lua
+        // generation, so its initial configuration must not be evaluated a
+        // second time in-process.
+        if crate::dmux_managed::should_reload_gui_configuration(
+            config::configuration().dmux_managed_gui,
+        ) {
+            config::reload();
+        }
 
         // And build the initial menu bar.
         // TODO: arrange for this to happen on config reload.
@@ -284,10 +334,16 @@ impl GuiFrontEnd {
                 // This is not currently possible, but could be in the
                 // future.
 
-                if !crate::dmux_managed::should_perform_native_action(
-                    config::configuration().dmux_managed_gui,
-                    &action,
-                ) {
+                let managed = config::configuration().dmux_managed_gui;
+                if let Some(event) = managed_application_request_event(managed, &action) {
+                    log::info!(
+                        "delegating denied zero-window native quit to managed event {event}"
+                    );
+                    emit_managed_application_quit_requested();
+                    return;
+                }
+
+                if !crate::dmux_managed::should_perform_native_action(managed, &action) {
                     log::warn!(
                         "refusing forbidden zero-window native action in dmux-managed GUI: {action:?}"
                     );
@@ -506,6 +562,30 @@ impl GuiFrontEnd {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod dmux_application_event_tests {
+    use super::*;
+
+    #[test]
+    fn managed_zero_window_quit_is_delegated_but_never_natively_allowed() {
+        let quit = KeyAssignment::QuitApplication;
+        assert_eq!(
+            managed_application_request_event(true, &quit),
+            Some(DMUX_MANAGED_APPLICATION_QUIT_REQUESTED)
+        );
+        assert!(!crate::dmux_managed::should_perform_native_action(
+            true, &quit
+        ));
+        assert_eq!(managed_application_request_event(false, &quit), None);
+        assert_eq!(
+            managed_application_request_event(true, &KeyAssignment::HideApplication),
+            None
+        );
+        assert!(!crate::dmux_managed::should_reload_gui_configuration(true));
+        assert!(crate::dmux_managed::should_reload_gui_configuration(false));
     }
 }
 

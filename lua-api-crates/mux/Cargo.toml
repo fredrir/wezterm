@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 config.workspace = true
 libc.workspace = true
 log.workspace = true
@@ -15,12 +16,17 @@ luahelper.workspace = true
 mux.workspace = true
 parking_lot.workspace = true
 portable-pty.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 smol.workspace = true
 termwiz-funcs.workspace = true
 termwiz.workspace = true
 url-funcs.workspace = true
 wezterm-dynamic.workspace = true
 wezterm-term.workspace = true
+wezterm-uds.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 promise.workspace = true
+tempfile.workspace = true

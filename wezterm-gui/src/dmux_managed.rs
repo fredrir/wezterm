@@ -47,7 +47,8 @@ pub(crate) fn is_forbidden_ui_action(action: &KeyAssignment) -> bool {
         | CloseCurrentTab { .. }
         | CloseCurrentPane { .. }
         | HideApplication
-        | QuitApplication => true,
+        | QuitApplication
+        | ReloadConfiguration => true,
         PaneSelect(args) => match args.mode {
             PaneSelectMode::Activate => false,
             PaneSelectMode::SwapWithActive
@@ -90,7 +91,6 @@ pub(crate) fn is_forbidden_ui_action(action: &KeyAssignment) -> bool {
         | DisableDefaultAssignment
         | Hide
         | Show
-        | ReloadConfiguration
         | ScrollByPage(_)
         | ScrollByLine(_)
         | ScrollByCurrentEventWheelDelta
@@ -144,6 +144,10 @@ pub(crate) fn should_perform_native_action(dmux_managed_gui: bool, action: &KeyA
 }
 
 pub(crate) fn should_close_tab_directly(dmux_managed_gui: bool) -> bool {
+    !dmux_managed_gui
+}
+
+pub(crate) fn should_reload_gui_configuration(dmux_managed_gui: bool) -> bool {
     !dmux_managed_gui
 }
 
@@ -363,6 +367,7 @@ mod tests {
             KeyAssignment::CloseCurrentTab { confirm: true },
             KeyAssignment::HideApplication,
             KeyAssignment::QuitApplication,
+            KeyAssignment::ReloadConfiguration,
         ];
         let mut actions = forbidden.clone();
         actions.push(safe.clone());
@@ -474,6 +479,8 @@ mod tests {
     fn direct_mouse_tab_close_is_flag_gated() {
         assert!(should_close_tab_directly(false));
         assert!(!should_close_tab_directly(true));
+        assert!(should_reload_gui_configuration(false));
+        assert!(!should_reload_gui_configuration(true));
     }
 
     #[test]
