@@ -4,7 +4,7 @@ use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
 use mux::Mux;
 use portable_pty::cmdbuilder::CommandBuilder;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Command;
 use std::rc::Rc;
@@ -83,16 +83,36 @@ fn main() {
     wezterm_blob_leases::clear_storage();
 }
 
+fn dmux_managed_service_flag_present(args: &[OsString]) -> bool {
+    args.iter()
+        .skip(1)
+        .take_while(|arg| arg.as_os_str() != OsStr::new("--"))
+        .any(|arg| arg.as_os_str() == OsStr::new("--dmux-managed-service"))
+}
+
 fn run() -> anyhow::Result<()> {
-    env_bootstrap::bootstrap();
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let managed_flag_present = dmux_managed_service_flag_present(&args);
 
-    //stats::Stats::init()?;
-    config::designate_this_as_the_main_thread();
-    let _saver = umask::UmaskSaver::new();
+    // On macOS, env_bootstrap initializes Foundation locale state, which can
+    // start helper threads.  The managed socket bootstrap temporarily changes
+    // cwd in order to bind relative to a held private-runtime dirfd, so its
+    // single-thread assertion and prebind must happen before env_bootstrap.
+    // Parse and validate the hidden service invocation first; ordinary mux
+    // invocations retain their upstream bootstrap-before-parse ordering.
+    if !managed_flag_present {
+        env_bootstrap::bootstrap();
+        config::designate_this_as_the_main_thread();
+    }
 
-    let opts = Opt::parse();
+    let opts = Opt::parse_from(args);
 
-    validate_dmux_managed_invocation(&opts)?;
+    if let Err(error) = validate_dmux_managed_invocation(&opts) {
+        if managed_flag_present {
+            eprintln!("dmux managed service invocation rejected: {error:#}");
+        }
+        return Err(error);
+    }
 
     #[cfg(unix)]
     {
@@ -105,10 +125,23 @@ fn run() -> anyhow::Result<()> {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let dmux_service_bootstrap = if opts.dmux_managed_service {
-        Some(mux_lua::dmux_descriptor::prebind_dmux_managed_service()?)
+        Some(
+            mux_lua::dmux_descriptor::prebind_dmux_managed_service().map_err(|error| {
+                eprintln!("dmux managed service prebind failed: {error:#}");
+                error
+            })?,
+        )
     } else {
         None
     };
+
+    if managed_flag_present {
+        env_bootstrap::bootstrap();
+        config::designate_this_as_the_main_thread();
+    }
+
+    //stats::Stats::init()?;
+    let _saver = umask::UmaskSaver::new();
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     anyhow::ensure!(
@@ -420,6 +453,25 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Opt, clap::Error> {
         Opt::try_parse_from(std::iter::once("wezterm-mux-server").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn managed_service_flag_is_detected_for_early_prebind_only() {
+        let args = IntoIterator::into_iter([
+            "wezterm-mux-server",
+            "--dmux-managed-service",
+            "--config-file",
+            "/tmp/dmux-mux.lua",
+        ])
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        assert!(dmux_managed_service_flag_present(&args));
+
+        let program_args =
+            IntoIterator::into_iter(["wezterm-mux-server", "--", "sh", "--dmux-managed-service"])
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+        assert!(!dmux_managed_service_flag_present(&program_args));
     }
 
     #[test]
