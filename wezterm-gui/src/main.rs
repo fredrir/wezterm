@@ -427,6 +427,16 @@ async fn async_run_terminal_gui(
         log::warn!("{:#}", err);
     }
 
+    if opts.dmux_resident_broker {
+        // NEW must prove a live, authenticated GUI broker before it reserves
+        // a Space. Start the bridge event/heartbeat loop without attaching
+        // the persistent domain and without entering the default-pane
+        // fallback. A later signed `present` request performs the exact
+        // incarnation-bound attach after owner creation succeeds.
+        trigger_and_log_gui_startup(None).await;
+        return Ok(());
+    }
+
     if !opts.no_auto_connect {
         connect_to_auto_connect_domains().await?;
     }
@@ -733,6 +743,13 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     }
 
     let config = config::configuration();
+    if opts.dmux_resident_broker {
+        anyhow::ensure!(
+            std::env::var_os("DMUX_WEZ_FIRST").as_deref() == Some(std::ffi::OsStr::new("1"))
+                && config.dmux_managed_gui,
+            "dmux resident GUI broker mode is available only under the managed wez-first contract"
+        );
+    }
     let need_builder = !opts.prog.is_empty() || opts.cwd.is_some();
 
     let cmd = if need_builder {
@@ -1179,6 +1196,8 @@ fn require_dmux_managed_gui_startup(sub: &SubCommand) -> anyhow::Result<()> {
             domain: start.domain.as_deref(),
             attach: start.attach,
             always_new_process: start.always_new_process,
+            no_auto_connect: start.no_auto_connect,
+            resident_broker: start.dmux_resident_broker,
             new_tab: start.new_tab,
             has_prog: !start.prog.is_empty(),
             has_cwd: start.cwd.is_some(),
@@ -1327,6 +1346,7 @@ fn run() -> anyhow::Result<()> {
                 new_tab: connect.new_tab,
                 always_new_process: true,
                 attach: true,
+                dmux_resident_broker: false,
                 _cmd: false,
                 no_auto_connect: false,
                 cwd: None,

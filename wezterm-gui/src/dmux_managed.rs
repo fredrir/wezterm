@@ -191,6 +191,8 @@ pub(crate) enum ManagedGuiStartupInvocation<'a> {
         domain: Option<&'a str>,
         attach: bool,
         always_new_process: bool,
+        no_auto_connect: bool,
+        resident_broker: bool,
         new_tab: bool,
         has_prog: bool,
         has_cwd: bool,
@@ -282,6 +284,8 @@ pub(crate) fn require_managed_startup_contract(
             domain,
             attach,
             always_new_process,
+            no_auto_connect,
+            resident_broker,
             new_tab,
             has_prog,
             has_cwd,
@@ -290,6 +294,7 @@ pub(crate) fn require_managed_startup_contract(
             domain == Some("dmux")
                 && attach
                 && always_new_process
+                && (!resident_broker || no_auto_connect)
                 && !new_tab
                 && !has_prog
                 && !has_cwd
@@ -559,6 +564,27 @@ mod tests {
                 domain: Some("dmux"),
                 attach: true,
                 always_new_process: true,
+                no_auto_connect: false,
+                resident_broker: false,
+                new_tab: false,
+                has_prog: false,
+                has_cwd: false,
+                has_workspace: false,
+            },
+        )
+        .unwrap();
+        require_managed_startup_contract(
+            true,
+            true,
+            &args,
+            &domains,
+            Some(socket),
+            ManagedGuiStartupInvocation::Start {
+                domain: Some("dmux"),
+                attach: true,
+                always_new_process: true,
+                no_auto_connect: true,
+                resident_broker: true,
                 new_tab: false,
                 has_prog: false,
                 has_cwd: false,
@@ -580,6 +606,19 @@ mod tests {
                 domain: None,
                 attach: false,
                 always_new_process: false,
+                no_auto_connect: false,
+                resident_broker: false,
+                new_tab: false,
+                has_prog: false,
+                has_cwd: false,
+                has_workspace: false,
+            },
+            ManagedGuiStartupInvocation::Start {
+                domain: Some("dmux"),
+                attach: true,
+                always_new_process: true,
+                no_auto_connect: false,
+                resident_broker: true,
                 new_tab: false,
                 has_prog: false,
                 has_cwd: false,

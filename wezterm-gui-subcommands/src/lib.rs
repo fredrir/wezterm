@@ -101,6 +101,16 @@ pub struct StartCommand {
     #[arg(long, requires = "domain")]
     pub attach: bool,
 
+    /// Start only the managed dmux GUI broker and do not attach or create a
+    /// pane. This is an internal pre-mutation lifecycle primitive; the
+    /// managed startup gate validates its complete invocation contract.
+    #[arg(
+        long = "dmux-resident-broker",
+        hide = true,
+        requires_all = ["domain", "attach", "always_new_process", "no_auto_connect"]
+    )]
+    pub dmux_resident_broker: bool,
+
     /// Instead of executing your shell, run PROG.
     /// For example: `wezterm start -- bash -l` will spawn bash
     /// as if it were a login shell. [aliases: -e]
