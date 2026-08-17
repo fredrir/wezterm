@@ -67,6 +67,7 @@ struct LauncherWitness {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LauncherOrigin {
+    kind: String,
     gui_instance: String,
     uid: u64,
     pid: u32,
@@ -1666,6 +1667,7 @@ fn capture_launcher_witness_from_process() -> CapturedLauncherWitness {
     }
     CapturedLauncherWitness::Present(LauncherWitness {
         origin: LauncherOrigin {
+            kind: "cold_launcher".to_string(),
             gui_instance: utf8[0].clone(),
             uid: unsafe { libc::geteuid() } as u64,
             pid,
@@ -1683,6 +1685,7 @@ fn capture_launcher_witness_from_process() -> CapturedLauncherWitness {
 
 fn launcher_witness_from_lua(origin: Table) -> mlua::Result<LauncherOrigin> {
     const FIELDS: &[&str] = &[
+        "kind",
         "gui_instance",
         "uid",
         "pid",
@@ -1712,6 +1715,7 @@ fn launcher_witness_from_lua(origin: Table) -> mlua::Result<LauncherOrigin> {
         }
     }
     Ok(LauncherOrigin {
+        kind: origin.raw_get("kind")?,
         gui_instance: origin.raw_get("gui_instance")?,
         uid: origin.raw_get("uid")?,
         pid: origin.raw_get("pid")?,
@@ -1738,7 +1742,8 @@ fn validate_launcher_witness(
     if let Some(space_uid) = &origin.space_uid {
         validate_uid(space_uid)?;
     }
-    if origin.domain.is_empty()
+    if origin.kind != "cold_launcher"
+        || origin.domain.is_empty()
         || origin.domain.len() > 256
         || origin
             .domain
@@ -2393,6 +2398,7 @@ mod tests {
     fn launcher_witness_is_exact_and_bound_to_leased_instance() {
         let witness = LauncherWitness {
             origin: LauncherOrigin {
+                kind: "cold_launcher".to_string(),
                 gui_instance: "gui-88888888888848888888888888888888".to_string(),
                 uid: unsafe { libc::geteuid() } as u64,
                 pid: 42,
@@ -2407,6 +2413,15 @@ mod tests {
             transport_backend_instance_uid: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_string(),
         };
         validate_launcher_witness(&witness, &witness.origin, &witness.origin.gui_instance).unwrap();
+
+        let mut wrong_kind = witness.origin.clone();
+        wrong_kind.kind = "resident_gui".to_string();
+        assert_eq!(
+            validate_launcher_witness(&witness, &wrong_kind, &witness.origin.gui_instance)
+                .unwrap_err()
+                .code,
+            "launcher_witness_invalid"
+        );
 
         let mut hostile = witness.origin.clone();
         hostile.launcher_request_uid = "77777777-7777-4777-8777-777777777777".to_string();
